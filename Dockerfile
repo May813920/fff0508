@@ -15,15 +15,11 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# 先升級 pip
 RUN pip install --no-cache-dir --upgrade pip
-
-# 安裝 Python 依賴
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Railway 會自動提供 PORT，不要固定只用 8501
 EXPOSE 8080
 
-CMD streamlit run app.py --server.address=0.0.0.0 --server.port=${PORT:-8080} --server.headless=true
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8080", "--server.headless=true"]
