@@ -1,0 +1,8 @@
+streamlit
+streamlit-webrtc
+streamlit-autorefresh
+ultralytics
+opencv-python-headless
+numpy
+pandas
+tornado
