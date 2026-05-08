@@ -153,6 +153,9 @@ if "sound_enabled" not in st.session_state:
 if "test_alarm_sound" not in st.session_state:
     st.session_state.test_alarm_sound = False
 
+if "preheat_audio" not in st.session_state:
+    st.session_state.preheat_audio = False
+
 
 # =========================
 # Helper
@@ -246,7 +249,7 @@ def classify_posture(results):
 
 
 # =========================
-# 音效檔案讀取
+# 讀取音效
 # =========================
 def get_alarm_audio_base64():
     audio_file = Path("alarm.mp3")
@@ -259,9 +262,9 @@ def get_alarm_audio_base64():
 
 
 # =========================
-# Start 後先啟用聲音
+# Start 時音訊預熱
 # =========================
-def render_sound_unlock():
+def render_audio_preheat():
     b64 = get_alarm_audio_base64()
 
     if b64 is None:
@@ -271,19 +274,20 @@ def render_sound_unlock():
     st.markdown(
         """
         <div class="sound-box">
-            🔊 請先按下方「啟用警報聲」。這會讓瀏覽器知道你允許這個網頁播放聲音。
+            🔊 音訊預熱：系統會嘗試短暫播放警報聲，讓瀏覽器允許後續警報自動播放。
+            如果沒有成功，請按下方「手動啟用警報聲」。
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    unlock_html = f"""
+    preheat_html = f"""
     <div style="margin-top: 10px;">
-        <audio id="unlockAudio">
+        <audio id="preheatAudio">
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
         </audio>
 
-        <button onclick="unlockSound()" 
+        <button onclick="manualPreheat()" 
             style="
                 background-color:#2563eb;
                 color:white;
@@ -293,43 +297,51 @@ def render_sound_unlock():
                 font-size:18px;
                 font-weight:700;
                 cursor:pointer;
+                margin-right:10px;
             ">
-            🔊 啟用警報聲
+            🔊 手動啟用警報聲
         </button>
 
-        <span id="unlockStatus" style="margin-left:12px; font-size:16px; color:#166534; font-weight:700;"></span>
+        <span id="preheatStatus" style="font-size:16px; color:#166534; font-weight:700;"></span>
 
         <script>
-            function unlockSound() {{
-                const audio = document.getElementById("unlockAudio");
-                const status = document.getElementById("unlockStatus");
+            const preheatAudio = document.getElementById("preheatAudio");
+            const preheatStatus = document.getElementById("preheatStatus");
 
-                audio.volume = 0.25;
-                audio.currentTime = 0;
+            function doPreheat() {{
+                preheatAudio.volume = 0.15;
+                preheatAudio.currentTime = 0;
 
-                audio.play().then(() => {{
-                    status.innerText = "已啟用";
+                preheatAudio.play().then(() => {{
+                    preheatStatus.innerText = "音訊已預熱";
                     setTimeout(() => {{
-                        audio.pause();
-                        audio.currentTime = 0;
-                        audio.volume = 1.0;
-                    }}, 400);
+                        preheatAudio.pause();
+                        preheatAudio.currentTime = 0;
+                        preheatAudio.volume = 1.0;
+                    }}, 300);
                 }}).catch((error) => {{
-                    status.innerText = "瀏覽器阻擋，請再按一次";
-                    console.log("Sound unlock failed:", error);
+                    preheatStatus.innerText = "自動預熱被瀏覽器阻擋，請按左側按鈕";
+                    console.log("Audio preheat blocked:", error);
                 }});
             }}
+
+            function manualPreheat() {{
+                doPreheat();
+            }}
+
+            // 頁面渲染後先自動嘗試一次
+            doPreheat();
         </script>
     </div>
     """
 
-    components.html(unlock_html, height=90)
+    components.html(preheat_html, height=95)
 
 
 # =========================
 # 警報聲播放
 # =========================
-def render_loop_alarm():
+def render_loop_alarm(autoplay=True):
     b64 = get_alarm_audio_base64()
 
     if b64 is None:
@@ -344,6 +356,13 @@ def render_loop_alarm():
         """,
         unsafe_allow_html=True
     )
+
+    auto_play_script = """
+        alarmAudio.play().catch(function(error) {
+            alarmStatus.innerText = "自動播放被瀏覽器阻擋，請按播放按鈕";
+            console.log("Autoplay blocked:", error);
+        });
+    """ if autoplay else ""
 
     alarm_html = f"""
     <div style="margin-top: 12px;">
@@ -377,31 +396,39 @@ def render_loop_alarm():
                 font-size:18px;
                 font-weight:700;
                 cursor:pointer;
+                margin-right:10px;
             ">
             ⏹ 停止警報聲
         </button>
 
+        <span id="alarmStatus" style="font-size:16px; color:#b91c1c; font-weight:700;"></span>
+
         <script>
-            const audio = document.getElementById("alarmAudio");
+            const alarmAudio = document.getElementById("alarmAudio");
+            const alarmStatus = document.getElementById("alarmStatus");
 
             function playAlarm() {{
-                audio.currentTime = 0;
-                audio.play();
+                alarmAudio.currentTime = 0;
+                alarmAudio.play().then(() => {{
+                    alarmStatus.innerText = "警報聲播放中";
+                }}).catch((error) => {{
+                    alarmStatus.innerText = "播放失敗，請再按一次";
+                    console.log("Play failed:", error);
+                }});
             }}
 
             function stopAlarm() {{
-                audio.pause();
-                audio.currentTime = 0;
+                alarmAudio.pause();
+                alarmAudio.currentTime = 0;
+                alarmStatus.innerText = "警報聲已停止";
             }}
 
-            audio.play().catch(function(error) {{
-                console.log("Autoplay was blocked by browser.");
-            }});
+            {auto_play_script}
         </script>
     </div>
     """
 
-    components.html(alarm_html, height=100)
+    components.html(alarm_html, height=110)
 
 
 # =========================
@@ -417,13 +444,9 @@ alarm_threshold = st.sidebar.slider(
     step=1
 )
 
-if st.sidebar.button("🔊 啟用警報聲"):
-    st.session_state.sound_enabled = True
-    st.sidebar.success("請到右側按下藍色『啟用警報聲』按鈕")
-
 if st.sidebar.button("🔔 測試警報聲"):
-    st.session_state.sound_enabled = True
     st.session_state.test_alarm_sound = True
+    st.session_state.sound_enabled = True
 
 st.sidebar.markdown("---")
 
@@ -431,7 +454,7 @@ st.sidebar.markdown("---")
 # =========================
 # Start button
 # =========================
-if st.sidebar.button("▶️ Start"):
+if st.sidebar.button("▶️ Start 啟動監測"):
     with shared_state.lock:
         shared_state.monitoring = True
         shared_state.start_time = time.time()
@@ -440,8 +463,9 @@ if st.sidebar.button("▶️ Start"):
         shared_state.alarm_acknowledged = False
         shared_state.last_posture = shared_state.current_posture
 
-    # 按 Start 後，自動進入準備啟用聲音的狀態
     st.session_state.sound_enabled = True
+    st.session_state.preheat_audio = True
+    st.toast("系統已啟動，正在嘗試預熱警報聲")
 
 
 # =========================
@@ -457,21 +481,22 @@ if st.sidebar.button("⏹ Stop"):
         shared_state.last_posture = "無人躺著"
 
     st.session_state.test_alarm_sound = False
+    st.session_state.preheat_audio = False
 
 st.sidebar.markdown("---")
 
 st.sidebar.info(
-    "按下 Start 後開始監測；右側會出現啟用警報聲按鈕。"
+    "按下 Start 後開始監測，系統會嘗試預熱警報音訊。"
 )
 
 
 # =========================
 # Autorefresh
 # =========================
-# 警報發生時先停止自動刷新，避免音訊播放器一直被重建，導致聲音中斷。
 with shared_state.lock:
     alarm_for_refresh = shared_state.alarm
 
+# 警報或測試音效時暫停刷新，避免音訊元件一直被重建
 if not alarm_for_refresh and not st.session_state.test_alarm_sound:
     st_autorefresh(interval=1000, key="refresh")
 
@@ -692,11 +717,11 @@ with right_col:
 
 
     # =========================
-    # Start 後啟用警報聲
+    # Start 後音訊預熱
     # =========================
-    if monitoring_now and st.session_state.sound_enabled and not alarm_now:
-        st.subheader("🔊 警報聲啟用")
-        render_sound_unlock()
+    if monitoring_now and st.session_state.preheat_audio and not alarm_now:
+        st.subheader("🔊 音訊預熱")
+        render_audio_preheat()
 
 
     # =========================
@@ -704,7 +729,7 @@ with right_col:
     # =========================
     if st.session_state.test_alarm_sound:
         st.subheader("🔔 警報聲測試")
-        render_loop_alarm()
+        render_loop_alarm(autoplay=True)
 
         if st.button("停止測試警報聲"):
             st.session_state.test_alarm_sound = False
@@ -724,13 +749,14 @@ with right_col:
         </div>
         """, unsafe_allow_html=True)
 
-        render_loop_alarm()
+        render_loop_alarm(autoplay=True)
 
         if st.button("✅ 確認此資訊", type="primary"):
             with shared_state.lock:
                 shared_state.alarm_acknowledged = True
                 shared_state.alarm = False
 
+            st.session_state.preheat_audio = False
             st.rerun()
 
     else:
