@@ -158,7 +158,7 @@ if "preheat_audio" not in st.session_state:
 
 
 # =========================
-# Helper
+# Helper functions
 # =========================
 def to_xy(point):
     return float(point[0]), float(point[1])
@@ -262,7 +262,7 @@ def get_alarm_audio_base64():
 
 
 # =========================
-# Start 時音訊預熱
+# Start 後音訊預熱
 # =========================
 def render_audio_preheat():
     b64 = get_alarm_audio_base64()
@@ -329,7 +329,6 @@ def render_audio_preheat():
                 doPreheat();
             }}
 
-            // 頁面渲染後先自動嘗試一次
             doPreheat();
         </script>
     </div>
@@ -465,7 +464,7 @@ if st.sidebar.button("▶️ Start 啟動監測"):
 
     st.session_state.sound_enabled = True
     st.session_state.preheat_audio = True
-    st.toast("系統已啟動，正在嘗試預熱警報聲")
+    st.toast("系統已啟動，正在嘗試開啟攝影機與預熱警報聲")
 
 
 # =========================
@@ -486,19 +485,15 @@ if st.sidebar.button("⏹ Stop"):
 st.sidebar.markdown("---")
 
 st.sidebar.info(
-    "按下 Start 後開始監測，系統會嘗試預熱警報音訊。"
+    "按下 Start 後開始監測，系統會嘗試開啟攝影機並預熱警報音訊。"
 )
 
 
 # =========================
 # Autorefresh
 # =========================
-with shared_state.lock:
-    alarm_for_refresh = shared_state.alarm
-
-# 警報或測試音效時暫停刷新，避免音訊元件一直被重建
-if not alarm_for_refresh and not st.session_state.test_alarm_sound:
-    st_autorefresh(interval=1000, key="refresh")
+# 這裡維持每秒刷新，所以警報觸發後右側資訊仍會繼續更新。
+st_autorefresh(interval=1000, key="refresh")
 
 
 # =========================
@@ -637,6 +632,13 @@ class PoseVideoProcessor(VideoProcessorBase):
 
 
 # =========================
+# 讀取目前監測狀態
+# =========================
+with shared_state.lock:
+    monitoring_for_webrtc = shared_state.monitoring
+
+
+# =========================
 # Layout
 # =========================
 left_col, right_col = st.columns([1.15, 1.4])
@@ -647,6 +649,10 @@ left_col, right_col = st.columns([1.15, 1.4])
 # =========================
 with left_col:
     st.subheader("1. 即時影像監測")
+
+    st.info(
+        "按左側 Start 後，系統會嘗試啟動攝影機。若瀏覽器跳出權限視窗，請按允許。"
+    )
 
     webrtc_streamer(
         key="pose-monitor",
@@ -666,6 +672,7 @@ with left_col:
         },
         video_processor_factory=PoseVideoProcessor,
         async_processing=True,
+        desired_playing=monitoring_for_webrtc,
     )
 
 
@@ -755,6 +762,9 @@ with right_col:
             with shared_state.lock:
                 shared_state.alarm_acknowledged = True
                 shared_state.alarm = False
+                shared_state.start_time = time.time()
+                shared_state.duration = 0.0
+                shared_state.last_posture = shared_state.current_posture
 
             st.session_state.preheat_audio = False
             st.rerun()
