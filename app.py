@@ -320,7 +320,7 @@ def render_audio_preheat():
                         preheatAudio.volume = 1.0;
                     }}, 300);
                 }}).catch((error) => {{
-                    preheatStatus.innerText = "自動預熱被瀏覽器阻擋，請按左側按鈕";
+                    preheatStatus.innerText = "自動預熱被瀏覽器阻擋，請按手動啟用";
                     console.log("Audio preheat blocked:", error);
                 }});
             }}
@@ -464,7 +464,7 @@ if st.sidebar.button("▶️ Start 啟動監測"):
 
     st.session_state.sound_enabled = True
     st.session_state.preheat_audio = True
-    st.toast("系統已啟動，正在嘗試開啟攝影機與預熱警報聲")
+    st.toast("系統已啟動，請先啟動影像區 START，並嘗試預熱警報聲")
 
 
 # =========================
@@ -485,14 +485,14 @@ if st.sidebar.button("⏹ Stop"):
 st.sidebar.markdown("---")
 
 st.sidebar.info(
-    "按下 Start 後開始監測，系統會嘗試開啟攝影機並預熱警報音訊。"
+    "請先按影像區 START 開啟攝影機，再按左側 Start 開始計時監測。"
 )
 
 
 # =========================
 # Autorefresh
 # =========================
-# 這裡維持每秒刷新，所以警報觸發後右側資訊仍會繼續更新。
+# 維持每秒刷新，所以警報觸發後仍會繼續更新右側資訊。
 st_autorefresh(interval=1000, key="refresh")
 
 
@@ -632,13 +632,6 @@ class PoseVideoProcessor(VideoProcessorBase):
 
 
 # =========================
-# 讀取目前監測狀態
-# =========================
-with shared_state.lock:
-    monitoring_for_webrtc = shared_state.monitoring
-
-
-# =========================
 # Layout
 # =========================
 left_col, right_col = st.columns([1.15, 1.4])
@@ -651,7 +644,7 @@ with left_col:
     st.subheader("1. 即時影像監測")
 
     st.info(
-        "按左側 Start 後，系統會嘗試啟動攝影機。若瀏覽器跳出權限視窗，請按允許。"
+        "請先按下方 WebRTC 的 START 開啟攝影機，允許瀏覽器權限後，再按左側 Start 開始計時。"
     )
 
     webrtc_streamer(
@@ -672,7 +665,6 @@ with left_col:
         },
         video_processor_factory=PoseVideoProcessor,
         async_processing=True,
-        desired_playing=monitoring_for_webrtc,
     )
 
 
