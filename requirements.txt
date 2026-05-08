@@ -1,5 +1,5 @@
 streamlit
-streamlit-webrtc>=0.0.68
+streamlit-webrtc==0.47.9
 streamlit-autorefresh
 ultralytics
 opencv-python-headless==4.9.0.80
