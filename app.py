@@ -246,28 +246,106 @@ def classify_posture(results):
 
 
 # =========================
-# Alarm sound
+# 音效檔案讀取
 # =========================
-def render_loop_alarm():
+def get_alarm_audio_base64():
     audio_file = Path("alarm.mp3")
 
     if not audio_file.exists():
-        st.warning("⚠️ 找不到 alarm.mp3，請確認 alarm.mp3 有放在 app.py 同一層。")
-        return
+        return None
 
     audio_bytes = audio_file.read_bytes()
-    b64 = base64.b64encode(audio_bytes).decode()
+    return base64.b64encode(audio_bytes).decode()
+
+
+# =========================
+# Start 後先啟用聲音
+# =========================
+def render_sound_unlock():
+    b64 = get_alarm_audio_base64()
+
+    if b64 is None:
+        st.warning("⚠️ 找不到 alarm.mp3，請確認 alarm.mp3 有放在 app.py 同一層。")
+        return
 
     st.markdown(
         """
         <div class="sound-box">
-            🔊 警報聲已觸發。若瀏覽器沒有自動播放，請按下方「播放警報聲」按鈕。
+            🔊 請先按下方「啟用警報聲」。這會讓瀏覽器知道你允許這個網頁播放聲音。
         </div>
         """,
         unsafe_allow_html=True
     )
 
-    audio_html = f"""
+    unlock_html = f"""
+    <div style="margin-top: 10px;">
+        <audio id="unlockAudio">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        </audio>
+
+        <button onclick="unlockSound()" 
+            style="
+                background-color:#2563eb;
+                color:white;
+                border:none;
+                border-radius:10px;
+                padding:12px 20px;
+                font-size:18px;
+                font-weight:700;
+                cursor:pointer;
+            ">
+            🔊 啟用警報聲
+        </button>
+
+        <span id="unlockStatus" style="margin-left:12px; font-size:16px; color:#166534; font-weight:700;"></span>
+
+        <script>
+            function unlockSound() {{
+                const audio = document.getElementById("unlockAudio");
+                const status = document.getElementById("unlockStatus");
+
+                audio.volume = 0.25;
+                audio.currentTime = 0;
+
+                audio.play().then(() => {{
+                    status.innerText = "已啟用";
+                    setTimeout(() => {{
+                        audio.pause();
+                        audio.currentTime = 0;
+                        audio.volume = 1.0;
+                    }}, 400);
+                }}).catch((error) => {{
+                    status.innerText = "瀏覽器阻擋，請再按一次";
+                    console.log("Sound unlock failed:", error);
+                }});
+            }}
+        </script>
+    </div>
+    """
+
+    components.html(unlock_html, height=90)
+
+
+# =========================
+# 警報聲播放
+# =========================
+def render_loop_alarm():
+    b64 = get_alarm_audio_base64()
+
+    if b64 is None:
+        st.warning("⚠️ 找不到 alarm.mp3，請確認 alarm.mp3 有放在 app.py 同一層。")
+        return
+
+    st.markdown(
+        """
+        <div class="sound-box">
+            🔊 警報聲已觸發。系統會嘗試自動播放；若沒有聲音，請按「播放警報聲」。
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    alarm_html = f"""
     <div style="margin-top: 12px;">
         <audio id="alarmAudio" loop>
             <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
@@ -323,7 +401,7 @@ def render_loop_alarm():
     </div>
     """
 
-    components.html(audio_html, height=100)
+    components.html(alarm_html, height=100)
 
 
 # =========================
@@ -341,7 +419,7 @@ alarm_threshold = st.sidebar.slider(
 
 if st.sidebar.button("🔊 啟用警報聲"):
     st.session_state.sound_enabled = True
-    st.sidebar.success("警報聲已啟用")
+    st.sidebar.success("請到右側按下藍色『啟用警報聲』按鈕")
 
 if st.sidebar.button("🔔 測試警報聲"):
     st.session_state.sound_enabled = True
@@ -362,6 +440,9 @@ if st.sidebar.button("▶️ Start"):
         shared_state.alarm_acknowledged = False
         shared_state.last_posture = shared_state.current_posture
 
+    # 按 Start 後，自動進入準備啟用聲音的狀態
+    st.session_state.sound_enabled = True
+
 
 # =========================
 # Stop button
@@ -380,12 +461,19 @@ if st.sidebar.button("⏹ Stop"):
 st.sidebar.markdown("---")
 
 st.sidebar.info(
-    "按下 Start 後開始監測；Stop 會停止並重新計算。"
+    "按下 Start 後開始監測；右側會出現啟用警報聲按鈕。"
 )
 
 
-# 每秒刷新
-st_autorefresh(interval=1000, key="refresh")
+# =========================
+# Autorefresh
+# =========================
+# 警報發生時先停止自動刷新，避免音訊播放器一直被重建，導致聲音中斷。
+with shared_state.lock:
+    alarm_for_refresh = shared_state.alarm
+
+if not alarm_for_refresh and not st.session_state.test_alarm_sound:
+    st_autorefresh(interval=1000, key="refresh")
 
 
 # =========================
@@ -601,6 +689,14 @@ with right_col:
         """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+
+    # =========================
+    # Start 後啟用警報聲
+    # =========================
+    if monitoring_now and st.session_state.sound_enabled and not alarm_now:
+        st.subheader("🔊 警報聲啟用")
+        render_sound_unlock()
 
 
     # =========================
