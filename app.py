@@ -78,6 +78,17 @@ st.markdown("""
     font-weight: 600;
 }
 
+.sound-box {
+    background-color: #fff7ed;
+    border: 1px solid #fdba74;
+    color: #9a3412;
+    border-radius: 12px;
+    padding: 12px;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-top: 10px;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -131,14 +142,22 @@ shared_state = st.session_state.shared_state
 if "sound_enabled" not in st.session_state:
     st.session_state.sound_enabled = False
 
+if "test_alarm_sound" not in st.session_state:
+    st.session_state.test_alarm_sound = False
+
 # =========================
 # Helper
 # =========================
+def to_xy(point):
+    return float(point[0]), float(point[1])
+
 def dist(p1, p2):
+    x1, y1 = to_xy(p1)
+    x2, y2 = to_xy(p2)
 
     return math.sqrt(
-        (p1[0] - p2[0])**2 +
-        (p1[1] - p2[1])**2
+        (x1 - x2) ** 2 +
+        (y1 - y2) ** 2
     )
 
 # =========================
@@ -148,47 +167,59 @@ def classify_posture(results):
 
     current_posture = "無人躺著"
 
-    if (
-        results[0].keypoints is not None
-        and len(results[0].keypoints.xy) > 0
-    ):
+    if results is None or len(results) == 0:
+        return current_posture
 
-        kps = results[0].keypoints.xy[0]
-        conf = results[0].keypoints.conf[0]
+    if results[0].keypoints is None:
+        return current_posture
 
-        if conf.max() > 0.5 and len(kps) >= 13:
+    if results[0].keypoints.xy is None or len(results[0].keypoints.xy) == 0:
+        return current_posture
 
-            shoulder_width = dist(kps[5], kps[6])
+    if results[0].keypoints.conf is None or len(results[0].keypoints.conf) == 0:
+        return current_posture
 
-            torso_length = (
-                dist(kps[5], kps[11]) +
-                dist(kps[6], kps[12])
-            ) / 2
+    kps = results[0].keypoints.xy[0]
+    conf = results[0].keypoints.conf[0]
 
-            is_side = (
-                (conf[5] < 0.4 or conf[6] < 0.4)
-                or
-                (torso_length > 0 and
-                 (shoulder_width / torso_length) < 0.5)
-            )
+    if len(kps) < 13:
+        return current_posture
 
-            if is_side:
+    if float(conf.max()) <= 0.5:
+        return current_posture
 
-                if (conf[4] + conf[6]) > (conf[3] + conf[5]) + 0.2:
-                    current_posture = "左側躺"
+    shoulder_width = dist(kps[5], kps[6])
 
-                elif (conf[3] + conf[5]) > (conf[4] + conf[6]) + 0.2:
-                    current_posture = "右側躺"
+    torso_length = (
+        dist(kps[5], kps[11]) +
+        dist(kps[6], kps[12])
+    ) / 2
 
-                else:
+    is_side = (
+        (float(conf[5]) < 0.4 or float(conf[6]) < 0.4)
+        or
+        (
+            torso_length > 0 and
+            (shoulder_width / torso_length) < 0.5
+        )
+    )
 
-                    if dist(kps[0], kps[3]) < dist(kps[0], kps[4]):
-                        current_posture = "右側躺"
-                    else:
-                        current_posture = "左側躺"
+    if is_side:
 
+        if (float(conf[4]) + float(conf[6])) > (float(conf[3]) + float(conf[5])) + 0.2:
+            current_posture = "左側躺"
+
+        elif (float(conf[3]) + float(conf[5])) > (float(conf[4]) + float(conf[6])) + 0.2:
+            current_posture = "右側躺"
+
+        else:
+            if dist(kps[0], kps[3]) < dist(kps[0], kps[4]):
+                current_posture = "右側躺"
             else:
-                current_posture = "仰躺"
+                current_posture = "左側躺"
+
+    else:
+        current_posture = "仰躺"
 
     return current_posture
 
@@ -197,31 +228,32 @@ def classify_posture(results):
 # =========================
 def render_loop_alarm():
 
-    if not st.session_state.sound_enabled:
-
-        st.warning("🔇 請先按左側『啟用警報聲』")
-
-        return
-
     audio_file = Path("alarm.mp3")
 
     if not audio_file.exists():
-
-        st.warning("⚠️ 找不到 alarm.mp3")
-
+        st.warning("⚠️ 找不到 alarm.mp3，請確認 alarm.mp3 有放在 app.py 同一層。")
         return
 
     audio_bytes = audio_file.read_bytes()
-
     b64 = base64.b64encode(audio_bytes).decode()
 
+    st.markdown(
+        """
+        <div class="sound-box">
+            🔊 警報聲已觸發。如果瀏覽器沒有自動播放，請手動按下方播放器的播放鍵。
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
     audio_html = f"""
-    <audio autoplay loop>
+    <audio controls autoplay loop style="width: 100%;">
         <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        你的瀏覽器不支援音訊播放。
     </audio>
     """
 
-    st.components.v1.html(audio_html, height=0)
+    st.components.v1.html(audio_html, height=80)
 
 # =========================
 # Sidebar
@@ -240,10 +272,12 @@ alarm_threshold = st.sidebar.slider(
 # Enable sound
 # =========================
 if st.sidebar.button("🔊 啟用警報聲"):
-
     st.session_state.sound_enabled = True
-
     st.sidebar.success("警報聲已啟用")
+
+if st.sidebar.button("🔔 測試警報聲"):
+    st.session_state.sound_enabled = True
+    st.session_state.test_alarm_sound = True
 
 st.sidebar.markdown("---")
 
@@ -303,17 +337,31 @@ class PoseVideoProcessor:
 
         img = frame.to_ndarray(format="bgr24")
 
-        results = model(img, verbose=False)
+        try:
+            results = model(img, verbose=False)
+            current_posture = classify_posture(results)
+            annotated = results[0].plot()
 
-        current_posture = classify_posture(results)
+        except Exception as e:
+            current_posture = "偵測錯誤"
+            annotated = img.copy()
+
+            cv2.putText(
+                annotated,
+                f"Detection error: {str(e)[:80]}",
+                (30, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA
+            )
 
         now = time.time()
 
         with shared_state.lock:
 
-            # =========================
             # Start 後才開始計算
-            # =========================
             if shared_state.monitoring:
 
                 # 同姿勢
@@ -338,12 +386,11 @@ class PoseVideoProcessor:
 
                     shared_state.alarm_acknowledged = False
 
-                # =========================
                 # Alarm 判定
-                # =========================
                 if (
                     shared_state.duration >= alarm_threshold
                     and current_posture != "無人躺著"
+                    and current_posture != "偵測錯誤"
                     and not shared_state.alarm_acknowledged
                 ):
 
@@ -353,6 +400,7 @@ class PoseVideoProcessor:
 
                     if (
                         current_posture == "無人躺著"
+                        or current_posture == "偵測錯誤"
                         or shared_state.alarm_acknowledged
                     ):
                         shared_state.alarm = False
@@ -368,20 +416,31 @@ class PoseVideoProcessor:
         # =========================
         # YOLO 畫圖
         # =========================
-        annotated = results[0].plot()
-
         with shared_state.lock:
 
             monitor_text = (
-                "監測中"
+                "Monitoring"
                 if shared_state.monitoring
-                else "已停止"
+                else "Stopped"
+            )
+
+            posture_map = {
+                "無人躺著": "No person",
+                "左側躺": "Left side",
+                "右側躺": "Right side",
+                "仰躺": "Supine",
+                "偵測錯誤": "Error"
+            }
+
+            posture_en = posture_map.get(
+                shared_state.current_posture,
+                "Unknown"
             )
 
             info_text = (
                 f"{monitor_text} | "
-                f"姿勢: {shared_state.current_posture} | "
-                f"持續時間: {int(shared_state.duration)} 秒"
+                f"Posture: {posture_en} | "
+                f"Time: {int(shared_state.duration)} sec"
             )
 
             cv2.rectangle(
@@ -403,9 +462,7 @@ class PoseVideoProcessor:
                 cv2.LINE_AA
             )
 
-            # =========================
             # Alarm 畫面
-            # =========================
             if shared_state.alarm:
 
                 cv2.rectangle(
@@ -451,7 +508,11 @@ with left_col:
 
         rtc_configuration={
             "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]}
+                {"urls": ["stun:stun.l.google.com:19302"]},
+                {"urls": ["stun:stun1.l.google.com:19302"]},
+                {"urls": ["stun:stun2.l.google.com:19302"]},
+                {"urls": ["stun:stun3.l.google.com:19302"]},
+                {"urls": ["stun:stun4.l.google.com:19302"]}
             ]
         },
 
@@ -521,6 +582,17 @@ with right_col:
         """, unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
+
+    # =========================
+    # 測試警報聲
+    # =========================
+    if st.session_state.test_alarm_sound:
+        st.subheader("🔔 警報聲測試")
+        render_loop_alarm()
+
+        if st.button("停止測試警報聲"):
+            st.session_state.test_alarm_sound = False
+            st.rerun()
 
     # =========================
     # Alarm 區
