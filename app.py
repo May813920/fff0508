@@ -1,4 +1,6 @@
 import streamlit as st
+import streamlit.components.v1 as components
+
 import cv2
 import math
 import av
@@ -7,7 +9,7 @@ import threading
 import base64
 
 from ultralytics import YOLO
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 from pathlib import Path
 from streamlit_autorefresh import st_autorefresh
 
@@ -87,6 +89,7 @@ st.markdown("""
     font-size: 1rem;
     font-weight: 600;
     margin-top: 10px;
+    margin-bottom: 10px;
 }
 
 </style>
@@ -240,20 +243,41 @@ def render_loop_alarm():
     st.markdown(
         """
         <div class="sound-box">
-            🔊 警報聲已觸發。如果瀏覽器沒有自動播放，請手動按下方播放器的播放鍵。
+            🔊 警報聲已觸發。若瀏覽器沒有自動播放，請手動按下方播放器的播放鍵。
         </div>
         """,
         unsafe_allow_html=True
     )
 
     audio_html = f"""
-    <audio controls autoplay loop style="width: 100%;">
+    <audio id="alarmAudio" controls autoplay loop style="width: 100%;">
         <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
         你的瀏覽器不支援音訊播放。
     </audio>
+
+    <script>
+        const audio = document.getElementById("alarmAudio");
+        audio.volume = 1.0;
+
+        function tryPlayAlarm() {{
+            const playPromise = audio.play();
+
+            if (playPromise !== undefined) {{
+                playPromise.catch(function(error) {{
+                    console.log("Autoplay was blocked by the browser.");
+                }});
+            }}
+        }}
+
+        tryPlayAlarm();
+
+        document.addEventListener("click", function() {{
+            tryPlayAlarm();
+        }}, {{ once: true }});
+    </script>
     """
 
-    st.components.v1.html(audio_html, height=80)
+    components.html(audio_html, height=90)
 
 # =========================
 # Sidebar
@@ -271,13 +295,12 @@ alarm_threshold = st.sidebar.slider(
 # =========================
 # Enable sound
 # =========================
-if st.sidebar.button("🔊 啟用警報聲"):
-    st.session_state.sound_enabled = True
-    st.sidebar.success("警報聲已啟用")
+if st.sidebar.button("🔊 啟用並測試警報聲"):
 
-if st.sidebar.button("🔔 測試警報聲"):
     st.session_state.sound_enabled = True
     st.session_state.test_alarm_sound = True
+
+    st.sidebar.success("警報聲已啟用，請在右側確認聲音是否能播放")
 
 st.sidebar.markdown("---")
 
@@ -319,6 +342,8 @@ if st.sidebar.button("⏹ Stop"):
 
         shared_state.last_posture = "無人躺著"
 
+    st.session_state.test_alarm_sound = False
+
 st.sidebar.markdown("---")
 
 st.sidebar.info(
@@ -331,7 +356,7 @@ st_autorefresh(interval=1000, key="refresh")
 # =========================
 # Video Processor
 # =========================
-class PoseVideoProcessor:
+class PoseVideoProcessor(VideoProcessorBase):
 
     def recv(self, frame):
 
@@ -501,6 +526,8 @@ with left_col:
 
     st.subheader("1. 即時影像監測")
 
+    st.info("請允許瀏覽器開啟相機。若出現找不到相機，請確認相機權限或改用有鏡頭的裝置。")
+
     webrtc_streamer(
         key="pose-monitor",
 
@@ -587,7 +614,9 @@ with right_col:
     # 測試警報聲
     # =========================
     if st.session_state.test_alarm_sound:
+
         st.subheader("🔔 警報聲測試")
+
         render_loop_alarm()
 
         if st.button("停止測試警報聲"):
