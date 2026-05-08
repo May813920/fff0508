@@ -7,11 +7,12 @@ import av
 import time
 import threading
 import base64
+from pathlib import Path
 
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
-from pathlib import Path
 from streamlit_autorefresh import st_autorefresh
+
 
 # =========================
 # Page config
@@ -21,6 +22,7 @@ st.set_page_config(
     page_icon="🛌",
     layout="wide"
 )
+
 
 # =========================
 # Custom style
@@ -85,7 +87,7 @@ st.markdown("""
     border: 1px solid #fdba74;
     color: #9a3412;
     border-radius: 12px;
-    padding: 12px;
+    padding: 14px;
     font-size: 1rem;
     font-weight: 600;
     margin-top: 10px;
@@ -94,6 +96,7 @@ st.markdown("""
 
 </style>
 """, unsafe_allow_html=True)
+
 
 # =========================
 # Title
@@ -108,6 +111,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+
 # =========================
 # Load YOLO model
 # =========================
@@ -115,15 +119,15 @@ st.markdown(
 def load_model():
     return YOLO("yolov8n-pose.pt")
 
+
 model = load_model()
+
 
 # =========================
 # Shared state
 # =========================
 class AppState:
-
     def __init__(self):
-
         self.lock = threading.Lock()
 
         self.current_posture = "無人躺著"
@@ -137,6 +141,7 @@ class AppState:
 
         self.monitoring = False
 
+
 if "shared_state" not in st.session_state:
     st.session_state.shared_state = AppState()
 
@@ -148,11 +153,13 @@ if "sound_enabled" not in st.session_state:
 if "test_alarm_sound" not in st.session_state:
     st.session_state.test_alarm_sound = False
 
+
 # =========================
 # Helper
 # =========================
 def to_xy(point):
     return float(point[0]), float(point[1])
+
 
 def dist(p1, p2):
     x1, y1 = to_xy(p1)
@@ -163,27 +170,29 @@ def dist(p1, p2):
         (y1 - y2) ** 2
     )
 
+
 # =========================
 # 姿勢分類
 # =========================
 def classify_posture(results):
-
     current_posture = "無人躺著"
 
     if results is None or len(results) == 0:
         return current_posture
 
-    if results[0].keypoints is None:
+    result = results[0]
+
+    if result.keypoints is None:
         return current_posture
 
-    if results[0].keypoints.xy is None or len(results[0].keypoints.xy) == 0:
+    if result.keypoints.xy is None or len(result.keypoints.xy) == 0:
         return current_posture
 
-    if results[0].keypoints.conf is None or len(results[0].keypoints.conf) == 0:
+    if result.keypoints.conf is None or len(result.keypoints.conf) == 0:
         return current_posture
 
-    kps = results[0].keypoints.xy[0]
-    conf = results[0].keypoints.conf[0]
+    kps = result.keypoints.xy[0]
+    conf = result.keypoints.conf[0]
 
     if len(kps) < 13:
         return current_posture
@@ -198,21 +207,30 @@ def classify_posture(results):
         dist(kps[6], kps[12])
     ) / 2
 
+    left_shoulder_conf = float(conf[5])
+    right_shoulder_conf = float(conf[6])
+
     is_side = (
-        (float(conf[5]) < 0.4 or float(conf[6]) < 0.4)
-        or
-        (
-            torso_length > 0 and
-            (shoulder_width / torso_length) < 0.5
+        left_shoulder_conf < 0.4
+        or right_shoulder_conf < 0.4
+        or (
+            torso_length > 0
+            and (shoulder_width / torso_length) < 0.5
         )
     )
 
     if is_side:
+        left_ear_conf = float(conf[3])
+        right_ear_conf = float(conf[4])
 
-        if (float(conf[4]) + float(conf[6])) > (float(conf[3]) + float(conf[5])) + 0.2:
+        if (right_ear_conf + right_shoulder_conf) > (
+            left_ear_conf + left_shoulder_conf
+        ) + 0.2:
             current_posture = "左側躺"
 
-        elif (float(conf[3]) + float(conf[5])) > (float(conf[4]) + float(conf[6])) + 0.2:
+        elif (left_ear_conf + left_shoulder_conf) > (
+            right_ear_conf + right_shoulder_conf
+        ) + 0.2:
             current_posture = "右側躺"
 
         else:
@@ -226,11 +244,11 @@ def classify_posture(results):
 
     return current_posture
 
+
 # =========================
 # Alarm sound
 # =========================
 def render_loop_alarm():
-
     audio_file = Path("alarm.mp3")
 
     if not audio_file.exists():
@@ -243,41 +261,70 @@ def render_loop_alarm():
     st.markdown(
         """
         <div class="sound-box">
-            🔊 警報聲已觸發。若瀏覽器沒有自動播放，請手動按下方播放器的播放鍵。
+            🔊 警報聲已觸發。若瀏覽器沒有自動播放，請按下方「播放警報聲」按鈕。
         </div>
         """,
         unsafe_allow_html=True
     )
 
     audio_html = f"""
-    <audio id="alarmAudio" controls autoplay loop style="width: 100%;">
-        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-        你的瀏覽器不支援音訊播放。
-    </audio>
+    <div style="margin-top: 12px;">
+        <audio id="alarmAudio" loop>
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            你的瀏覽器不支援音訊播放。
+        </audio>
 
-    <script>
-        const audio = document.getElementById("alarmAudio");
-        audio.volume = 1.0;
+        <button onclick="playAlarm()" 
+            style="
+                background-color:#dc2626;
+                color:white;
+                border:none;
+                border-radius:10px;
+                padding:12px 20px;
+                font-size:18px;
+                font-weight:700;
+                cursor:pointer;
+                margin-right:10px;
+            ">
+            🔊 播放警報聲
+        </button>
 
-        function tryPlayAlarm() {{
-            const playPromise = audio.play();
+        <button onclick="stopAlarm()" 
+            style="
+                background-color:#4b5563;
+                color:white;
+                border:none;
+                border-radius:10px;
+                padding:12px 20px;
+                font-size:18px;
+                font-weight:700;
+                cursor:pointer;
+            ">
+            ⏹ 停止警報聲
+        </button>
 
-            if (playPromise !== undefined) {{
-                playPromise.catch(function(error) {{
-                    console.log("Autoplay was blocked by the browser.");
-                }});
+        <script>
+            const audio = document.getElementById("alarmAudio");
+
+            function playAlarm() {{
+                audio.currentTime = 0;
+                audio.play();
             }}
-        }}
 
-        tryPlayAlarm();
+            function stopAlarm() {{
+                audio.pause();
+                audio.currentTime = 0;
+            }}
 
-        document.addEventListener("click", function() {{
-            tryPlayAlarm();
-        }}, {{ once: true }});
-    </script>
+            audio.play().catch(function(error) {{
+                console.log("Autoplay was blocked by browser.");
+            }});
+        </script>
+    </div>
     """
 
-    components.html(audio_html, height=90)
+    components.html(audio_html, height=100)
+
 
 # =========================
 # Sidebar
@@ -292,54 +339,40 @@ alarm_threshold = st.sidebar.slider(
     step=1
 )
 
-# =========================
-# Enable sound
-# =========================
-if st.sidebar.button("🔊 啟用並測試警報聲"):
+if st.sidebar.button("🔊 啟用警報聲"):
+    st.session_state.sound_enabled = True
+    st.sidebar.success("警報聲已啟用")
 
+if st.sidebar.button("🔔 測試警報聲"):
     st.session_state.sound_enabled = True
     st.session_state.test_alarm_sound = True
 
-    st.sidebar.success("警報聲已啟用，請在右側確認聲音是否能播放")
-
 st.sidebar.markdown("---")
+
 
 # =========================
 # Start button
 # =========================
 if st.sidebar.button("▶️ Start"):
-
     with shared_state.lock:
-
         shared_state.monitoring = True
-
         shared_state.start_time = time.time()
-
         shared_state.duration = 0.0
-
         shared_state.alarm = False
-
         shared_state.alarm_acknowledged = False
-
         shared_state.last_posture = shared_state.current_posture
+
 
 # =========================
 # Stop button
 # =========================
 if st.sidebar.button("⏹ Stop"):
-
     with shared_state.lock:
-
         shared_state.monitoring = False
-
         shared_state.duration = 0.0
-
         shared_state.alarm = False
-
         shared_state.alarm_acknowledged = False
-
         shared_state.current_posture = "無人躺著"
-
         shared_state.last_posture = "無人躺著"
 
     st.session_state.test_alarm_sound = False
@@ -350,16 +383,16 @@ st.sidebar.info(
     "按下 Start 後開始監測；Stop 會停止並重新計算。"
 )
 
+
 # 每秒刷新
 st_autorefresh(interval=1000, key="refresh")
+
 
 # =========================
 # Video Processor
 # =========================
 class PoseVideoProcessor(VideoProcessorBase):
-
     def recv(self, frame):
-
         img = frame.to_ndarray(format="bgr24")
 
         try:
@@ -385,44 +418,27 @@ class PoseVideoProcessor(VideoProcessorBase):
         now = time.time()
 
         with shared_state.lock:
-
-            # Start 後才開始計算
             if shared_state.monitoring:
-
-                # 同姿勢
                 if current_posture == shared_state.last_posture:
+                    shared_state.duration = now - shared_state.start_time
 
-                    shared_state.duration = (
-                        now - shared_state.start_time
-                    )
-
-                # 姿勢改變
                 else:
-
                     shared_state.last_posture = current_posture
-
                     shared_state.current_posture = current_posture
-
                     shared_state.start_time = now
-
                     shared_state.duration = 0.0
-
                     shared_state.alarm = False
-
                     shared_state.alarm_acknowledged = False
 
-                # Alarm 判定
                 if (
                     shared_state.duration >= alarm_threshold
                     and current_posture != "無人躺著"
                     and current_posture != "偵測錯誤"
                     and not shared_state.alarm_acknowledged
                 ):
-
                     shared_state.alarm = True
 
                 else:
-
                     if (
                         current_posture == "無人躺著"
                         or current_posture == "偵測錯誤"
@@ -433,15 +449,9 @@ class PoseVideoProcessor(VideoProcessorBase):
                 shared_state.current_posture = current_posture
 
             else:
-
                 shared_state.duration = 0.0
-
                 shared_state.alarm = False
-
-        # =========================
-        # YOLO 畫圖
-        # =========================
-        with shared_state.lock:
+                shared_state.current_posture = current_posture
 
             monitor_text = (
                 "Monitoring"
@@ -487,9 +497,7 @@ class PoseVideoProcessor(VideoProcessorBase):
                 cv2.LINE_AA
             )
 
-            # Alarm 畫面
             if shared_state.alarm:
-
                 cv2.rectangle(
                     annotated,
                     (0, 0),
@@ -514,25 +522,22 @@ class PoseVideoProcessor(VideoProcessorBase):
             format="bgr24"
         )
 
+
 # =========================
 # Layout
 # =========================
 left_col, right_col = st.columns([1.15, 1.4])
 
+
 # =========================
 # Webcam
 # =========================
 with left_col:
-
     st.subheader("1. 即時影像監測")
-
-    st.info("請允許瀏覽器開啟相機。若出現找不到相機，請確認相機權限或改用有鏡頭的裝置。")
 
     webrtc_streamer(
         key="pose-monitor",
-
         mode=WebRtcMode.SENDRECV,
-
         rtc_configuration={
             "iceServers": [
                 {"urls": ["stun:stun.l.google.com:19302"]},
@@ -542,39 +547,30 @@ with left_col:
                 {"urls": ["stun:stun4.l.google.com:19302"]}
             ]
         },
-
         media_stream_constraints={
             "video": True,
             "audio": False
         },
-
         video_processor_factory=PoseVideoProcessor,
-
         async_processing=True,
     )
+
 
 # =========================
 # Right Panel
 # =========================
 with right_col:
-
     st.subheader("2. 摘要資訊")
 
     with shared_state.lock:
-
         posture_now = shared_state.current_posture
-
         duration_now = int(shared_state.duration)
-
         alarm_now = shared_state.alarm
-
         monitoring_now = shared_state.monitoring
 
     c1, c2, c3 = st.columns(3)
 
-    # 姿勢
     with c1:
-
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">目前姿勢</div>
@@ -582,9 +578,7 @@ with right_col:
         </div>
         """, unsafe_allow_html=True)
 
-    # 秒數
     with c2:
-
         st.markdown(f"""
         <div class="metric-card">
             <div class="metric-label">持續時間</div>
@@ -592,9 +586,7 @@ with right_col:
         </div>
         """, unsafe_allow_html=True)
 
-    # 狀態
     with c3:
-
         system_text = (
             "監測中"
             if monitoring_now
@@ -610,18 +602,18 @@ with right_col:
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+
     # =========================
     # 測試警報聲
     # =========================
     if st.session_state.test_alarm_sound:
-
         st.subheader("🔔 警報聲測試")
-
         render_loop_alarm()
 
         if st.button("停止測試警報聲"):
             st.session_state.test_alarm_sound = False
             st.rerun()
+
 
     # =========================
     # Alarm 區
@@ -629,7 +621,6 @@ with right_col:
     st.subheader("3. 警報摘要")
 
     if alarm_now:
-
         st.markdown(f"""
         <div class="alert-box">
             🚨 偵測到姿勢持續超過 {alarm_threshold} 秒，
@@ -637,22 +628,16 @@ with right_col:
         </div>
         """, unsafe_allow_html=True)
 
-        # Alarm 聲
         render_loop_alarm()
 
-        # 確認按鈕
         if st.button("✅ 確認此資訊", type="primary"):
-
             with shared_state.lock:
-
                 shared_state.alarm_acknowledged = True
-
                 shared_state.alarm = False
 
             st.rerun()
 
     else:
-
         st.markdown("""
         <div class="normal-box">
             ✅ 目前尚未觸發警報
