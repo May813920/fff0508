@@ -1,7 +1,11 @@
-streamlit
+streamlit==1.37.1
+streamlit-webrtc==0.47.9
+streamlit-autorefresh
+tornado==6.4.1
 ultralytics
 opencv-python-headless
 numpy<2
 Pillow
 torch
 torchvision
+av
