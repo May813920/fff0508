@@ -772,11 +772,29 @@ with right_col:
     st.subheader("2. 摘要資訊")
 
     with shared_state.lock:
-        posture_now = shared_state.current_posture
+    posture_now = shared_state.current_posture
+    alarm_now = shared_state.alarm
+    monitoring_now = shared_state.monitoring
+
+    if (
+        shared_state.monitoring
+        and shared_state.current_posture != "無人躺著"
+        and shared_state.current_posture != "偵測錯誤"
+    ):
+        duration_now = int(time.time() - shared_state.start_time)
+        shared_state.duration = duration_now
+    else:
         duration_now = int(shared_state.duration)
-        alarm_now = shared_state.alarm
-        monitoring_now = shared_state.monitoring
-        recording_now = shared_state.recording
+
+    if (
+        shared_state.monitoring
+        and shared_state.current_posture != "無人躺著"
+        and shared_state.current_posture != "偵測錯誤"
+        and duration_now >= alarm_threshold
+        and not shared_state.alarm_acknowledged
+    ):
+        shared_state.alarm = True
+        alarm_now = True
 
     c1, c2, c3 = st.columns(3)
 
