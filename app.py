@@ -164,6 +164,10 @@ if "shared_state" not in st.session_state:
 
 shared_state = st.session_state.shared_state
 
+
+# =========================
+# Session state
+# =========================
 if "sound_enabled" not in st.session_state:
     st.session_state.sound_enabled = False
 
@@ -172,6 +176,19 @@ if "test_alarm_sound" not in st.session_state:
 
 if "recorded_video_path" not in st.session_state:
     st.session_state.recorded_video_path = None
+
+# 警報時間設定，放在 session_state，避免每次重新執行後被重設
+if "alarm_minutes" not in st.session_state:
+    st.session_state.alarm_minutes = 0
+
+if "alarm_seconds" not in st.session_state:
+    st.session_state.alarm_seconds = 10
+
+if "alarm_threshold" not in st.session_state:
+    st.session_state.alarm_threshold = 10
+
+if "alarm_time_text" not in st.session_state:
+    st.session_state.alarm_time_text = "10 秒"
 
 
 # =========================
@@ -383,34 +400,49 @@ def render_loop_alarm():
 # =========================
 st.sidebar.header("⚙️ 分析設定")
 
+# =========================
+# Alarm time setting form
+# =========================
 st.sidebar.subheader("⏰ 警報時間設定")
 
-alarm_minutes = st.sidebar.number_input(
-    "分鐘",
-    min_value=0,
-    max_value=120,
-    value=0,
-    step=1
-)
+with st.sidebar.form("alarm_time_form"):
+    new_alarm_minutes = st.number_input(
+        "分鐘",
+        min_value=0,
+        max_value=120,
+        value=st.session_state.alarm_minutes,
+        step=1
+    )
 
-alarm_seconds = st.sidebar.number_input(
-    "秒",
-    min_value=0,
-    max_value=59,
-    value=10,
-    step=1
-)
+    new_alarm_seconds = st.number_input(
+        "秒",
+        min_value=0,
+        max_value=59,
+        value=st.session_state.alarm_seconds,
+        step=1
+    )
 
-# 將分鐘＋秒換算成總秒數，給程式判斷用
-alarm_threshold = alarm_minutes * 60 + alarm_seconds
+    apply_alarm_time = st.form_submit_button("套用警報時間")
 
-# 避免設定成 0 分 0 秒，造成警報立即觸發
-if alarm_threshold <= 0:
-    alarm_threshold = 1
-    alarm_time_text = "1 秒"
-    st.sidebar.warning("警報時間不能是 0，系統已自動改為 1 秒。")
-else:
-    alarm_time_text = format_alarm_time(alarm_minutes, alarm_seconds)
+if apply_alarm_time:
+    new_threshold = new_alarm_minutes * 60 + new_alarm_seconds
+
+    if new_threshold <= 0:
+        new_threshold = 1
+        new_alarm_minutes = 0
+        new_alarm_seconds = 1
+        st.sidebar.warning("警報時間不能是 0，系統已自動改為 1 秒。")
+
+    st.session_state.alarm_minutes = new_alarm_minutes
+    st.session_state.alarm_seconds = new_alarm_seconds
+    st.session_state.alarm_threshold = new_threshold
+    st.session_state.alarm_time_text = format_alarm_time(
+        new_alarm_minutes,
+        new_alarm_seconds
+    )
+
+alarm_threshold = st.session_state.alarm_threshold
+alarm_time_text = st.session_state.alarm_time_text
 
 st.sidebar.info(
     f"目前設定：{alarm_time_text} 後觸發警報"
@@ -418,6 +450,10 @@ st.sidebar.info(
 
 st.sidebar.markdown("---")
 
+
+# =========================
+# Sound buttons
+# =========================
 if st.sidebar.button("🔊 啟用警報聲"):
     st.session_state.sound_enabled = True
     st.sidebar.success("警報聲已啟用")
@@ -497,7 +533,7 @@ else:
 st.sidebar.markdown("---")
 
 st.sidebar.info(
-    "按下 Start 後開始監測；若要錄影，請再按「開始錄影」。"
+    "建議先設定警報時間，再按 Start 與開始錄影。錄影中不要調整側邊欄設定，避免鏡頭重新連線。"
 )
 
 
@@ -850,12 +886,13 @@ with right_col:
     st.markdown(
         """
         1. 開啟網頁後，請允許瀏覽器使用相機。  
-        2. 按下左側 **Start** 開始即時姿勢監測。  
-        3. 可在左側設定警報時間，例如 10 秒、1 分、1 分 30 秒。  
+        2. 先設定警報時間，按 **套用警報時間**。  
+        3. 按左側 **Start** 開始即時姿勢監測。  
         4. 若要錄影，按左側 **⏺ 開始錄影**。  
         5. 錄影時畫面會顯示 **REC**。  
-        6. 按 **⏹ 停止錄影** 後，右側會出現下載按鈕。  
-        7. 若同一姿勢維持超過設定時間，會觸發警報。  
-        8. 若使用 iPhone，警報聲可能需要手動按「播放警報聲」才會響。
+        6. 錄影中請不要調整側邊欄設定，避免相機重新連線。  
+        7. 按 **⏹ 停止錄影** 後，右側會出現下載按鈕。  
+        8. 若同一姿勢維持超過設定時間，會觸發警報。  
+        9. 若使用 iPhone，警報聲可能需要手動按「播放警報聲」才會響。
         """
     )
