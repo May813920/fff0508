@@ -7,8 +7,12 @@ import av
 import time
 import threading
 import base64
+import tempfile
 from pathlib import Path
+from collections import Counter
 
+import numpy as np
+from PIL import Image, ImageOps
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
 from streamlit_autorefresh import st_autorefresh
@@ -27,9 +31,9 @@ st.set_page_config(
 # =========================
 # Custom style
 # =========================
-st.markdown("""
+st.markdown(
+    """
 <style>
-
 .main-title {
     font-size: 2.2rem;
     font-weight: 700;
@@ -94,8 +98,21 @@ st.markdown("""
     margin-bottom: 10px;
 }
 
+.upload-result-box {
+    background-color: #eef6ff;
+    border: 1px solid #bfdbfe;
+    color: #1e3a8a;
+    border-radius: 12px;
+    padding: 14px;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-top: 10px;
+    margin-bottom: 10px;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 
 # =========================
@@ -103,12 +120,12 @@ st.markdown("""
 # =========================
 st.markdown(
     '<div class="main-title">🛌 長照睡姿固定過久警報系統</div>',
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 st.markdown(
     '<div class="sub-text">使用影像分析臥床姿勢變化，協助照護員及早發現長時間未翻身狀況。</div>',
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 
@@ -153,12 +170,9 @@ if "sound_enabled" not in st.session_state:
 if "test_alarm_sound" not in st.session_state:
     st.session_state.test_alarm_sound = False
 
-if "external_camera_running" not in st.session_state:
-    st.session_state.external_camera_running = False
-
 
 # =========================
-# Helper
+# Helper functions
 # =========================
 def to_xy(point):
     return float(point[0]), float(point[1])
@@ -167,17 +181,13 @@ def to_xy(point):
 def dist(p1, p2):
     x1, y1 = to_xy(p1)
     x2, y2 = to_xy(p2)
-
-    return math.sqrt(
-        (x1 - x2) ** 2 +
-        (y1 - y2) ** 2
-    )
+    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
 
 
-def resize_frame(img, max_width=640):
+def resize_frame_bgr(img, max_width=640):
     """
-    手機後鏡頭或外部攝影機解析度可能太高，
-    先縮小再丟進 YOLO，避免 Railway 跑太慢或卡住。
+    手機後鏡頭、上傳圖片、上傳影片解析度可能很高，
+    先縮小再丟進 YOLO，避免 Railway 跑太慢或記憶體不足。
     """
     h, w = img.shape[:2]
 
@@ -187,6 +197,22 @@ def resize_frame(img, max_width=640):
         img = cv2.resize(img, (max_width, new_h))
 
     return img
+
+
+def pil_to_bgr(image_pil):
+    """
+    PIL image 轉 OpenCV BGR。
+    ImageOps.exif_transpose 可修正手機照片旋轉方向。
+    """
+    image_pil = ImageOps.exif_transpose(image_pil)
+    image_pil = image_pil.convert("RGB")
+    image_rgb = np.array(image_pil)
+    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    return image_bgr
+
+
+def bgr_to_rgb(img_bgr):
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
 
 # =========================
@@ -221,8 +247,8 @@ def classify_posture(results):
     shoulder_width = dist(kps[5], kps[6])
 
     torso_length = (
-        dist(kps[5], kps[11]) +
-        dist(kps[6], kps[12])
+        dist(kps[5], kps[11])
+        + dist(kps[6], kps[12])
     ) / 2
 
     left_shoulder_conf = float(conf[5])
@@ -264,6 +290,163 @@ def classify_posture(results):
 
 
 # =========================
+# 共用偵測函式：圖片 / 影片 / 即時影像都會用
+# =========================
+def detect_posture_on_bgr(img_bgr, draw_overlay=False, overlay_text=None):
+    img_bgr = resize_frame_bgr(img_bgr, max_width=640)
+
+    try:
+        results = model(img_bgr, verbose=False, imgsz=640)
+        posture = classify_posture(results)
+        annotated = results[0].plot()
+
+    except Exception as e:
+        posture = "偵測錯誤"
+        annotated = img_bgr.copy()
+
+        cv2.putText(
+            annotated,
+            f"Detection error: {str(e)[:80]}",
+            (30, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if draw_overlay:
+        if overlay_text is None:
+            overlay_text = f"Posture: {posture}"
+
+        cv2.rectangle(
+            annotated,
+            (20, 20),
+            (min(900, annotated.shape[1] - 20), 70),
+            (0, 0, 0),
+            -1,
+        )
+
+        cv2.putText(
+            annotated,
+            overlay_text,
+            (30, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    return annotated, posture
+
+
+# =========================
+# 即時影像狀態更新
+# =========================
+def update_live_alarm_state(current_posture, alarm_threshold):
+    now = time.time()
+
+    with shared_state.lock:
+        if shared_state.monitoring:
+            if current_posture == shared_state.last_posture:
+                shared_state.duration = now - shared_state.start_time
+
+            else:
+                shared_state.last_posture = current_posture
+                shared_state.current_posture = current_posture
+                shared_state.start_time = now
+                shared_state.duration = 0.0
+                shared_state.alarm = False
+                shared_state.alarm_acknowledged = False
+
+            if (
+                shared_state.duration >= alarm_threshold
+                and current_posture != "無人躺著"
+                and current_posture != "偵測錯誤"
+                and not shared_state.alarm_acknowledged
+            ):
+                shared_state.alarm = True
+
+            else:
+                if (
+                    current_posture == "無人躺著"
+                    or current_posture == "偵測錯誤"
+                    or shared_state.alarm_acknowledged
+                ):
+                    shared_state.alarm = False
+
+            shared_state.current_posture = current_posture
+
+        else:
+            shared_state.duration = 0.0
+            shared_state.alarm = False
+            shared_state.current_posture = current_posture
+
+
+def draw_live_status(annotated):
+    with shared_state.lock:
+        monitor_text = "Monitoring" if shared_state.monitoring else "Stopped"
+
+        posture_map = {
+            "無人躺著": "No person",
+            "左側躺": "Left side",
+            "右側躺": "Right side",
+            "仰躺": "Supine",
+            "偵測錯誤": "Error",
+        }
+
+        posture_en = posture_map.get(shared_state.current_posture, "Unknown")
+
+        info_text = (
+            f"{monitor_text} | "
+            f"Posture: {posture_en} | "
+            f"Time: {int(shared_state.duration)} sec"
+        )
+
+        cv2.rectangle(
+            annotated,
+            (20, 20),
+            (min(900, annotated.shape[1] - 20), 70),
+            (0, 0, 0),
+            -1,
+        )
+
+        cv2.putText(
+            annotated,
+            info_text,
+            (30, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        if shared_state.alarm:
+            cv2.rectangle(
+                annotated,
+                (0, 0),
+                (annotated.shape[1], annotated.shape[0]),
+                (0, 0, 255),
+                10,
+            )
+
+            cv2.putText(
+                annotated,
+                "ALARM",
+                (30, 110),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.5,
+                (0, 0, 255),
+                4,
+                cv2.LINE_AA,
+            )
+
+    return annotated
+
+
+# =========================
 # Alarm sound
 # =========================
 def render_loop_alarm():
@@ -282,7 +465,7 @@ def render_loop_alarm():
             🔊 警報聲已觸發。若瀏覽器沒有自動播放，請按下方「播放警報聲」按鈕。
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     audio_html = f"""
@@ -349,43 +532,31 @@ def render_loop_alarm():
 # =========================
 st.sidebar.header("⚙️ 分析設定")
 
-camera_source = st.sidebar.radio(
-    "選擇攝影機來源",
-    ["目前裝置鏡頭", "其他裝置攝影機 URL"],
-    index=0
+camera_choice = st.sidebar.radio(
+    "即時鏡頭選擇",
+    ["前鏡頭", "後鏡頭"],
+    index=1,
 )
 
-camera_choice = "後鏡頭"
-facing_mode = "environment"
-
-if camera_source == "目前裝置鏡頭":
-    camera_choice = st.sidebar.radio(
-        "選擇鏡頭",
-        ["前鏡頭", "後鏡頭"],
-        index=1
-    )
-
-    if camera_choice == "前鏡頭":
-        facing_mode = "user"
-    else:
-        facing_mode = "environment"
-
-camera_url = ""
-
-if camera_source == "其他裝置攝影機 URL":
-    camera_url = st.sidebar.text_input(
-        "請輸入攝影機串流網址",
-        placeholder="例如：https://xxxx.ngrok-free.app/video 或 rtsp://..."
-    )
-
-st.sidebar.markdown("---")
+if camera_choice == "前鏡頭":
+    facing_mode = "user"
+else:
+    facing_mode = "environment"
 
 alarm_threshold = st.sidebar.slider(
     "同姿勢維持幾秒觸發警報",
     min_value=3,
     max_value=60,
     value=10,
-    step=1
+    step=1,
+)
+
+video_sample_interval = st.sidebar.slider(
+    "影片每隔幾幀分析一次",
+    min_value=5,
+    max_value=60,
+    value=15,
+    step=5,
 )
 
 if st.sidebar.button("🔊 啟用警報聲"):
@@ -425,187 +596,60 @@ if st.sidebar.button("⏹ Stop"):
         shared_state.last_posture = "無人躺著"
 
     st.session_state.test_alarm_sound = False
-    st.session_state.external_camera_running = False
 
 st.sidebar.markdown("---")
 
 st.sidebar.info(
-    "按下 Start 後開始監測；Stop 會停止並重新計算。"
+    "即時鏡頭請先按 Start；圖片與影片上傳可直接分析，不影響即時警報計時。"
 )
 
-if camera_source == "其他裝置攝影機 URL":
-    st.sidebar.warning(
-        "提醒：Railway 無法直接連到 192.168.x.x、localhost 這類區網網址。"
-    )
 
-
-# 每秒刷新右側資訊
+# 每秒刷新
 st_autorefresh(interval=1000, key="refresh")
 
 
 # =========================
-# 共用影像處理邏輯
-# =========================
-def process_image_frame(img):
-    """
-    WebRTC 和其他裝置攝影機 URL 共用這個函式。
-    """
-    img = resize_frame(img, max_width=640)
-
-    try:
-        results = model(img, verbose=False, imgsz=640)
-        current_posture = classify_posture(results)
-        annotated = results[0].plot()
-
-    except Exception as e:
-        current_posture = "偵測錯誤"
-        annotated = img.copy()
-
-        cv2.putText(
-            annotated,
-            f"Detection error: {str(e)[:80]}",
-            (30, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-    now = time.time()
-
-    with shared_state.lock:
-        if shared_state.monitoring:
-            if current_posture == shared_state.last_posture:
-                shared_state.duration = now - shared_state.start_time
-
-            else:
-                shared_state.last_posture = current_posture
-                shared_state.current_posture = current_posture
-                shared_state.start_time = now
-                shared_state.duration = 0.0
-                shared_state.alarm = False
-                shared_state.alarm_acknowledged = False
-
-            if (
-                shared_state.duration >= alarm_threshold
-                and current_posture != "無人躺著"
-                and current_posture != "偵測錯誤"
-                and not shared_state.alarm_acknowledged
-            ):
-                shared_state.alarm = True
-
-            else:
-                if (
-                    current_posture == "無人躺著"
-                    or current_posture == "偵測錯誤"
-                    or shared_state.alarm_acknowledged
-                ):
-                    shared_state.alarm = False
-
-            shared_state.current_posture = current_posture
-
-        else:
-            shared_state.duration = 0.0
-            shared_state.alarm = False
-            shared_state.current_posture = current_posture
-
-        monitor_text = (
-            "Monitoring"
-            if shared_state.monitoring
-            else "Stopped"
-        )
-
-        posture_map = {
-            "無人躺著": "No person",
-            "左側躺": "Left side",
-            "右側躺": "Right side",
-            "仰躺": "Supine",
-            "偵測錯誤": "Error"
-        }
-
-        posture_en = posture_map.get(
-            shared_state.current_posture,
-            "Unknown"
-        )
-
-        info_text = (
-            f"{monitor_text} | "
-            f"Posture: {posture_en} | "
-            f"Time: {int(shared_state.duration)} sec"
-        )
-
-        cv2.rectangle(
-            annotated,
-            (20, 20),
-            (min(900, annotated.shape[1] - 20), 70),
-            (0, 0, 0),
-            -1
-        )
-
-        cv2.putText(
-            annotated,
-            info_text,
-            (30, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-        if shared_state.alarm:
-            cv2.rectangle(
-                annotated,
-                (0, 0),
-                (annotated.shape[1], annotated.shape[0]),
-                (0, 0, 255),
-                10
-            )
-
-            cv2.putText(
-                annotated,
-                "ALARM",
-                (30, 110),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1.5,
-                (0, 0, 255),
-                4,
-                cv2.LINE_AA
-            )
-
-    return annotated
-
-
-# =========================
-# Video Processor
+# Video Processor for WebRTC
 # =========================
 class PoseVideoProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
 
-        annotated = process_image_frame(img)
+        annotated, current_posture = detect_posture_on_bgr(
+            img,
+            draw_overlay=False,
+        )
+
+        update_live_alarm_state(current_posture, alarm_threshold)
+        annotated = draw_live_status(annotated)
 
         return av.VideoFrame.from_ndarray(
             annotated,
-            format="bgr24"
+            format="bgr24",
         )
 
 
 # =========================
 # Layout
 # =========================
-left_col, right_col = st.columns([1.15, 1.4])
+left_col, right_col = st.columns([1.25, 1.35])
 
 
 # =========================
-# Camera Panel
+# Left Panel
 # =========================
 with left_col:
-    st.subheader("1. 即時影像監測")
+    st.subheader("1. 影像來源")
 
-    if camera_source == "目前裝置鏡頭":
-        st.info(f"目前使用：{camera_choice}")
+    tab_live, tab_image, tab_video = st.tabs(
+        ["📷 即時鏡頭", "🖼️ 上傳圖片", "🎞️ 上傳影片"]
+    )
+
+    # =========================
+    # Tab 1: Live camera
+    # =========================
+    with tab_live:
+        st.info(f"目前鏡頭設定：{camera_choice}")
 
         webrtc_streamer(
             key=f"pose-monitor-{facing_mode}",
@@ -616,7 +660,7 @@ with left_col:
                     {"urls": ["stun:stun1.l.google.com:19302"]},
                     {"urls": ["stun:stun2.l.google.com:19302"]},
                     {"urls": ["stun:stun3.l.google.com:19302"]},
-                    {"urls": ["stun:stun4.l.google.com:19302"]}
+                    {"urls": ["stun:stun4.l.google.com:19302"]},
                 ]
             },
             media_stream_constraints={
@@ -626,74 +670,195 @@ with left_col:
                     "height": {"ideal": 480, "max": 720},
                     "frameRate": {"ideal": 10, "max": 15},
                 },
-                "audio": False
+                "audio": False,
             },
             video_processor_factory=PoseVideoProcessor,
             async_processing=True,
         )
 
-    else:
-        st.info("目前使用：其他裝置攝影機 URL")
+    # =========================
+    # Tab 2: Upload image
+    # =========================
+    with tab_image:
+        st.markdown("### 🖼️ 上傳圖片偵測")
+        st.caption("支援 JPG、JPEG、PNG。可判斷：仰躺、左側躺、右側躺、無人躺著。")
 
-        st.markdown(
-            """
-            可輸入其他攝影機串流網址，例如 IP Camera、ngrok、Cloudflare Tunnel 或公開 RTSP/HTTP 串流。
-            
-            注意：如果網址是 `192.168.x.x`、`localhost`、`127.0.0.1`，
-            Railway 通常無法讀取，因為那是你的本地區網。
-            """
+        uploaded_image = st.file_uploader(
+            "請上傳病床圖片",
+            type=["jpg", "jpeg", "png"],
+            key="image_uploader",
         )
 
-        if camera_url.strip() == "":
-            st.warning("請先在左側輸入攝影機串流網址。")
+        if uploaded_image is not None:
+            image_pil = Image.open(uploaded_image)
+            image_bgr = pil_to_bgr(image_pil)
+
+            st.image(
+                bgr_to_rgb(resize_frame_bgr(image_bgr.copy(), max_width=640)),
+                caption="原始圖片",
+                use_container_width=True,
+            )
+
+            if st.button("開始分析圖片", type="primary"):
+                with st.spinner("正在分析圖片姿勢..."):
+                    annotated_bgr, posture = detect_posture_on_bgr(
+                        image_bgr,
+                        draw_overlay=True,
+                    )
+
+                st.markdown(
+                    f"""
+                    <div class="upload-result-box">
+                        圖片偵測結果：{posture}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+                st.image(
+                    bgr_to_rgb(annotated_bgr),
+                    caption=f"圖片偵測結果：{posture}",
+                    use_container_width=True,
+                )
 
         else:
-            col_a, col_b = st.columns(2)
+            st.info("請先上傳一張圖片。")
 
-            with col_a:
-                if st.button("▶️ 讀取其他裝置攝影機", type="primary"):
-                    st.session_state.external_camera_running = True
+    # =========================
+    # Tab 3: Upload video
+    # =========================
+    with tab_video:
+        st.markdown("### 🎞️ 上傳影片偵測")
+        st.caption("支援 MP4、MOV、AVI。系統會抽幀分析影片中的姿勢。")
 
-            with col_b:
-                if st.button("⏹ 停止讀取外部攝影機"):
-                    st.session_state.external_camera_running = False
+        uploaded_video = st.file_uploader(
+            "請上傳影片",
+            type=["mp4", "mov", "avi"],
+            key="video_uploader",
+        )
 
-            frame_placeholder = st.empty()
+        max_analyze_frames = st.slider(
+            "最多分析幾個抽樣畫面",
+            min_value=10,
+            max_value=200,
+            value=60,
+            step=10,
+        )
 
-            if st.session_state.external_camera_running:
-                cap = cv2.VideoCapture(camera_url)
+        if uploaded_video is not None:
+            video_bytes = uploaded_video.getvalue()
+            st.video(video_bytes)
+
+            if st.button("開始分析影片", type="primary"):
+                suffix = Path(uploaded_video.name).suffix
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_video:
+                    temp_video.write(video_bytes)
+                    temp_video_path = temp_video.name
+
+                cap = cv2.VideoCapture(temp_video_path)
 
                 if not cap.isOpened():
-                    st.error("無法連線到攝影機。請確認網址是否正確，且 Railway 可以連到該網址。")
-                    st.session_state.external_camera_running = False
+                    st.error("影片讀取失敗，請確認影片格式是否正確。")
+                    Path(temp_video_path).unlink(missing_ok=True)
 
                 else:
-                    st.success("已連線到外部攝影機，正在讀取影像。")
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    fps = cap.get(cv2.CAP_PROP_FPS)
 
-                    # 每次執行讀取一小段，避免 Streamlit 長時間卡死
-                    for _ in range(80):
-                        if not st.session_state.external_camera_running:
-                            break
+                    if total_frames <= 0:
+                        total_frames = 1
 
+                    st.write(f"影片總幀數：約 {total_frames}")
+                    if fps and fps > 0:
+                        st.write(f"影片 FPS：約 {fps:.2f}")
+
+                    progress = st.progress(0)
+                    status_text = st.empty()
+
+                    posture_list = []
+                    sample_images = []
+
+                    frame_idx = 0
+                    analyzed_count = 0
+
+                    while True:
                         ret, frame = cap.read()
 
                         if not ret:
-                            st.warning("讀取不到影像，串流可能中斷。")
-                            st.session_state.external_camera_running = False
                             break
 
-                        annotated = process_image_frame(frame)
-                        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                        if frame_idx % video_sample_interval == 0:
+                            annotated_bgr, posture = detect_posture_on_bgr(
+                                frame,
+                                draw_overlay=True,
+                                overlay_text=f"Frame {frame_idx}",
+                            )
 
-                        frame_placeholder.image(
-                            annotated_rgb,
-                            channels="RGB",
-                            use_container_width=True
-                        )
+                            # 再加上正確姿勢文字
+                            overlay_text = f"Frame {frame_idx} | Posture: {posture}"
+                            annotated_bgr, posture = detect_posture_on_bgr(
+                                frame,
+                                draw_overlay=True,
+                                overlay_text=overlay_text,
+                            )
 
-                        time.sleep(0.08)
+                            posture_list.append(posture)
+
+                            if len(sample_images) < 6:
+                                sample_images.append(
+                                    (frame_idx, posture, bgr_to_rgb(annotated_bgr))
+                                )
+
+                            analyzed_count += 1
+
+                            status_text.write(
+                                f"正在分析：第 {frame_idx} 幀，已分析 {analyzed_count} 張抽樣畫面"
+                            )
+
+                            if analyzed_count >= max_analyze_frames:
+                                break
+
+                        frame_idx += 1
+                        progress.progress(min(frame_idx / total_frames, 1.0))
 
                     cap.release()
+                    Path(temp_video_path).unlink(missing_ok=True)
+                    progress.progress(1.0)
+
+                    if len(posture_list) == 0:
+                        st.warning("影片中沒有成功分析到畫面。")
+
+                    else:
+                        posture_counter = Counter(posture_list)
+                        most_common_posture, most_common_count = posture_counter.most_common(1)[0]
+
+                        st.markdown(
+                            f"""
+                            <div class="upload-result-box">
+                                影片主要姿勢：{most_common_posture}<br>
+                                已分析抽樣畫面：{len(posture_list)} 張
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        st.markdown("#### 影片姿勢統計")
+
+                        for posture_name in ["仰躺", "左側躺", "右側躺", "無人躺著", "偵測錯誤"]:
+                            st.write(f"{posture_name}：{posture_counter.get(posture_name, 0)} 張")
+
+                        st.markdown("#### 抽樣偵測畫面")
+
+                        for idx, posture, img_rgb in sample_images:
+                            st.image(
+                                img_rgb,
+                                caption=f"第 {idx} 幀：{posture}",
+                                use_container_width=True,
+                            )
+
+        else:
+            st.info("請先上傳一段影片。")
 
 
 # =========================
@@ -711,37 +876,41 @@ with right_col:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">目前姿勢</div>
-            <div class="metric-value">{posture_now}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c2:
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">持續時間</div>
-            <div class="metric-value">{duration_now} 秒</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c3:
-        system_text = (
-            "監測中"
-            if monitoring_now
-            else "停止"
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">目前姿勢</div>
+                <div class="metric-value">{posture_now}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-        st.markdown(f"""
-        <div class="metric-card">
-            <div class="metric-label">系統狀態</div>
-            <div class="metric-value">{system_text}</div>
-        </div>
-        """, unsafe_allow_html=True)
+    with c2:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">持續時間</div>
+                <div class="metric-value">{duration_now} 秒</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c3:
+        system_text = "監測中" if monitoring_now else "停止"
+
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-label">系統狀態</div>
+                <div class="metric-value">{system_text}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<br>", unsafe_allow_html=True)
-
 
     # =========================
     # 測試警報聲
@@ -754,19 +923,21 @@ with right_col:
             st.session_state.test_alarm_sound = False
             st.rerun()
 
-
     # =========================
     # Alarm 區
     # =========================
     st.subheader("3. 警報摘要")
 
     if alarm_now:
-        st.markdown(f"""
-        <div class="alert-box">
-            🚨 偵測到姿勢持續超過 {alarm_threshold} 秒，
-            請協助翻身。
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="alert-box">
+                🚨 偵測到姿勢持續超過 {alarm_threshold} 秒，
+                請協助翻身。
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         render_loop_alarm()
 
@@ -778,26 +949,30 @@ with right_col:
             st.rerun()
 
     else:
-        st.markdown("""
-        <div class="normal-box">
-            ✅ 目前尚未觸發警報
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="normal-box">
+                ✅ 目前尚未觸發警報
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.markdown("---")
 
-    st.subheader("4. 使用提醒")
+    st.subheader("4. 功能說明")
 
     st.markdown(
         """
-        **目前裝置鏡頭模式：**
-        - 適合直接用手機或電腦打開網頁。
-        - 可選擇前鏡頭或後鏡頭。
-        - 後鏡頭解析度較高，程式已自動縮小影像以提升穩定度。
+        **即時鏡頭：**  
+        用目前裝置的前鏡頭或後鏡頭進行即時姿勢監測，並可觸發警報。
 
-        **其他裝置攝影機 URL 模式：**
-        - 可輸入公開的攝影機串流網址。
-        - Railway 通常無法讀取 `192.168.x.x` 這種區網網址。
-        - 如果要用另一支手機當攝影機，通常需要 ngrok 或 Cloudflare Tunnel 轉成公開網址。
+        **上傳圖片：**  
+        上傳單張病床圖片後，系統會判斷仰躺、左側躺、右側躺或無人躺著。
+
+        **上傳影片：**  
+        上傳影片後，系統會依照設定每隔幾幀抽樣分析一次，並統計影片中的主要姿勢。
+
+        注意：圖片與影片分析不會影響右側即時警報秒數；右側秒數主要對應即時鏡頭監測。
         """
     )
