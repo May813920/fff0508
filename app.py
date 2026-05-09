@@ -772,9 +772,9 @@ with right_col:
     st.subheader("2. 摘要資訊")
 
     with shared_state.lock:
-    posture_now = shared_state.current_posture
-    alarm_now = shared_state.alarm
-    monitoring_now = shared_state.monitoring
+        posture_now = shared_state.current_posture
+        alarm_now = shared_state.alarm
+        monitoring_now = shared_state.monitoring
 
     if (
         shared_state.monitoring
