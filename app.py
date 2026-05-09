@@ -752,18 +752,16 @@ with left_col:
                 {"urls": ["stun:stun4.l.google.com:19302"]}
             ]
         },
-        media_stream_constraints={
-            "video": {
-                "width": {"ideal": 640, "max": 960},
-                "height": {"ideal": 480, "max": 720},
-                "frameRate": {"ideal": 10, "max": 15},
-            },
-            "audio": False
-        },
-        video_processor_factory=PoseVideoProcessor,
-        async_processing=True,
+       media_stream_constraints={
+    "video": {
+        "facingMode": {"ideal": "environment"},
+        "width": {"ideal": 480, "max": 640},
+        "height": {"ideal": 360, "max": 480},
+        "frameRate": {"ideal": 5, "max": 8},
+    },
+    "audio": False
+},
     )
-
 
 # =========================
 # Right Panel
@@ -771,20 +769,20 @@ with left_col:
 with right_col:
     st.subheader("2. 摘要資訊")
 
-with shared_state.lock:
-    posture_now = shared_state.current_posture
-    alarm_now = shared_state.alarm
-    monitoring_now = shared_state.monitoring
+    with shared_state.lock:
+        posture_now = shared_state.current_posture
+        alarm_now = shared_state.alarm
+        monitoring_now = shared_state.monitoring
 
-    if (
-        shared_state.monitoring
-        and shared_state.current_posture != "無人躺著"
-        and shared_state.current_posture != "偵測錯誤"
-    ):
-        duration_now = int(time.time() - shared_state.start_time)
-        shared_state.duration = duration_now
-    else:
-        duration_now = int(shared_state.duration)
+        if (
+            shared_state.monitoring
+            and shared_state.current_posture != "無人躺著"
+            and shared_state.current_posture != "偵測錯誤"
+        ):
+            duration_now = int(time.time() - shared_state.start_time)
+            shared_state.duration = duration_now
+        else:
+            duration_now = int(shared_state.duration)
 
     c1, c2, c3 = st.columns(3)
 
@@ -813,9 +811,6 @@ with shared_state.lock:
             <div class="metric-value">{system_text}</div>
         </div>
         """, unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
 
     # =========================
     # 測試警報聲
