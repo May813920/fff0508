@@ -786,16 +786,6 @@ with shared_state.lock:
     else:
         duration_now = int(shared_state.duration)
 
-    if (
-        shared_state.monitoring
-        and shared_state.current_posture != "無人躺著"
-        and shared_state.current_posture != "偵測錯誤"
-        and duration_now >= alarm_threshold
-        and not shared_state.alarm_acknowledged
-    ):
-        shared_state.alarm = True
-        alarm_now = True
-
     c1, c2, c3 = st.columns(3)
 
     with c1:
