@@ -153,6 +153,9 @@ if "sound_enabled" not in st.session_state:
 if "test_alarm_sound" not in st.session_state:
     st.session_state.test_alarm_sound = False
 
+if "external_camera_running" not in st.session_state:
+    st.session_state.external_camera_running = False
+
 
 # =========================
 # Helper
@@ -169,6 +172,21 @@ def dist(p1, p2):
         (x1 - x2) ** 2 +
         (y1 - y2) ** 2
     )
+
+
+def resize_frame(img, max_width=640):
+    """
+    手機後鏡頭或外部攝影機解析度可能太高，
+    先縮小再丟進 YOLO，避免 Railway 跑太慢或卡住。
+    """
+    h, w = img.shape[:2]
+
+    if w > max_width:
+        scale = max_width / w
+        new_h = int(h * scale)
+        img = cv2.resize(img, (max_width, new_h))
+
+    return img
 
 
 # =========================
@@ -331,6 +349,37 @@ def render_loop_alarm():
 # =========================
 st.sidebar.header("⚙️ 分析設定")
 
+camera_source = st.sidebar.radio(
+    "選擇攝影機來源",
+    ["目前裝置鏡頭", "其他裝置攝影機 URL"],
+    index=0
+)
+
+camera_choice = "後鏡頭"
+facing_mode = "environment"
+
+if camera_source == "目前裝置鏡頭":
+    camera_choice = st.sidebar.radio(
+        "選擇鏡頭",
+        ["前鏡頭", "後鏡頭"],
+        index=1
+    )
+
+    if camera_choice == "前鏡頭":
+        facing_mode = "user"
+    else:
+        facing_mode = "environment"
+
+camera_url = ""
+
+if camera_source == "其他裝置攝影機 URL":
+    camera_url = st.sidebar.text_input(
+        "請輸入攝影機串流網址",
+        placeholder="例如：https://xxxx.ngrok-free.app/video 或 rtsp://..."
+    )
+
+st.sidebar.markdown("---")
+
 alarm_threshold = st.sidebar.slider(
     "同姿勢維持幾秒觸發警報",
     min_value=3,
@@ -376,6 +425,7 @@ if st.sidebar.button("⏹ Stop"):
         shared_state.last_posture = "無人躺著"
 
     st.session_state.test_alarm_sound = False
+    st.session_state.external_camera_running = False
 
 st.sidebar.markdown("---")
 
@@ -383,9 +433,148 @@ st.sidebar.info(
     "按下 Start 後開始監測；Stop 會停止並重新計算。"
 )
 
+if camera_source == "其他裝置攝影機 URL":
+    st.sidebar.warning(
+        "提醒：Railway 無法直接連到 192.168.x.x、localhost 這類區網網址。"
+    )
 
-# 每秒刷新
+
+# 每秒刷新右側資訊
 st_autorefresh(interval=1000, key="refresh")
+
+
+# =========================
+# 共用影像處理邏輯
+# =========================
+def process_image_frame(img):
+    """
+    WebRTC 和其他裝置攝影機 URL 共用這個函式。
+    """
+    img = resize_frame(img, max_width=640)
+
+    try:
+        results = model(img, verbose=False, imgsz=640)
+        current_posture = classify_posture(results)
+        annotated = results[0].plot()
+
+    except Exception as e:
+        current_posture = "偵測錯誤"
+        annotated = img.copy()
+
+        cv2.putText(
+            annotated,
+            f"Detection error: {str(e)[:80]}",
+            (30, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    now = time.time()
+
+    with shared_state.lock:
+        if shared_state.monitoring:
+            if current_posture == shared_state.last_posture:
+                shared_state.duration = now - shared_state.start_time
+
+            else:
+                shared_state.last_posture = current_posture
+                shared_state.current_posture = current_posture
+                shared_state.start_time = now
+                shared_state.duration = 0.0
+                shared_state.alarm = False
+                shared_state.alarm_acknowledged = False
+
+            if (
+                shared_state.duration >= alarm_threshold
+                and current_posture != "無人躺著"
+                and current_posture != "偵測錯誤"
+                and not shared_state.alarm_acknowledged
+            ):
+                shared_state.alarm = True
+
+            else:
+                if (
+                    current_posture == "無人躺著"
+                    or current_posture == "偵測錯誤"
+                    or shared_state.alarm_acknowledged
+                ):
+                    shared_state.alarm = False
+
+            shared_state.current_posture = current_posture
+
+        else:
+            shared_state.duration = 0.0
+            shared_state.alarm = False
+            shared_state.current_posture = current_posture
+
+        monitor_text = (
+            "Monitoring"
+            if shared_state.monitoring
+            else "Stopped"
+        )
+
+        posture_map = {
+            "無人躺著": "No person",
+            "左側躺": "Left side",
+            "右側躺": "Right side",
+            "仰躺": "Supine",
+            "偵測錯誤": "Error"
+        }
+
+        posture_en = posture_map.get(
+            shared_state.current_posture,
+            "Unknown"
+        )
+
+        info_text = (
+            f"{monitor_text} | "
+            f"Posture: {posture_en} | "
+            f"Time: {int(shared_state.duration)} sec"
+        )
+
+        cv2.rectangle(
+            annotated,
+            (20, 20),
+            (min(900, annotated.shape[1] - 20), 70),
+            (0, 0, 0),
+            -1
+        )
+
+        cv2.putText(
+            annotated,
+            info_text,
+            (30, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        if shared_state.alarm:
+            cv2.rectangle(
+                annotated,
+                (0, 0),
+                (annotated.shape[1], annotated.shape[0]),
+                (0, 0, 255),
+                10
+            )
+
+            cv2.putText(
+                annotated,
+                "ALARM",
+                (30, 110),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.5,
+                (0, 0, 255),
+                4,
+                cv2.LINE_AA
+            )
+
+    return annotated
 
 
 # =========================
@@ -395,127 +584,7 @@ class PoseVideoProcessor(VideoProcessorBase):
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
 
-        try:
-            results = model(img, verbose=False)
-            current_posture = classify_posture(results)
-            annotated = results[0].plot()
-
-        except Exception as e:
-            current_posture = "偵測錯誤"
-            annotated = img.copy()
-
-            cv2.putText(
-                annotated,
-                f"Detection error: {str(e)[:80]}",
-                (30, 55),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA
-            )
-
-        now = time.time()
-
-        with shared_state.lock:
-            if shared_state.monitoring:
-                if current_posture == shared_state.last_posture:
-                    shared_state.duration = now - shared_state.start_time
-
-                else:
-                    shared_state.last_posture = current_posture
-                    shared_state.current_posture = current_posture
-                    shared_state.start_time = now
-                    shared_state.duration = 0.0
-                    shared_state.alarm = False
-                    shared_state.alarm_acknowledged = False
-
-                if (
-                    shared_state.duration >= alarm_threshold
-                    and current_posture != "無人躺著"
-                    and current_posture != "偵測錯誤"
-                    and not shared_state.alarm_acknowledged
-                ):
-                    shared_state.alarm = True
-
-                else:
-                    if (
-                        current_posture == "無人躺著"
-                        or current_posture == "偵測錯誤"
-                        or shared_state.alarm_acknowledged
-                    ):
-                        shared_state.alarm = False
-
-                shared_state.current_posture = current_posture
-
-            else:
-                shared_state.duration = 0.0
-                shared_state.alarm = False
-                shared_state.current_posture = current_posture
-
-            monitor_text = (
-                "Monitoring"
-                if shared_state.monitoring
-                else "Stopped"
-            )
-
-            posture_map = {
-                "無人躺著": "No person",
-                "左側躺": "Left side",
-                "右側躺": "Right side",
-                "仰躺": "Supine",
-                "偵測錯誤": "Error"
-            }
-
-            posture_en = posture_map.get(
-                shared_state.current_posture,
-                "Unknown"
-            )
-
-            info_text = (
-                f"{monitor_text} | "
-                f"Posture: {posture_en} | "
-                f"Time: {int(shared_state.duration)} sec"
-            )
-
-            cv2.rectangle(
-                annotated,
-                (20, 20),
-                (900, 70),
-                (0, 0, 0),
-                -1
-            )
-
-            cv2.putText(
-                annotated,
-                info_text,
-                (30, 55),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA
-            )
-
-            if shared_state.alarm:
-                cv2.rectangle(
-                    annotated,
-                    (0, 0),
-                    (annotated.shape[1], annotated.shape[0]),
-                    (0, 0, 255),
-                    10
-                )
-
-                cv2.putText(
-                    annotated,
-                    "ALARM",
-                    (30, 110),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.5,
-                    (0, 0, 255),
-                    4,
-                    cv2.LINE_AA
-                )
+        annotated = process_image_frame(img)
 
         return av.VideoFrame.from_ndarray(
             annotated,
@@ -530,30 +599,101 @@ left_col, right_col = st.columns([1.15, 1.4])
 
 
 # =========================
-# Webcam
+# Camera Panel
 # =========================
 with left_col:
     st.subheader("1. 即時影像監測")
 
-    webrtc_streamer(
-        key="pose-monitor",
-        mode=WebRtcMode.SENDRECV,
-        rtc_configuration={
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]},
-                {"urls": ["stun:stun1.l.google.com:19302"]},
-                {"urls": ["stun:stun2.l.google.com:19302"]},
-                {"urls": ["stun:stun3.l.google.com:19302"]},
-                {"urls": ["stun:stun4.l.google.com:19302"]}
-            ]
-        },
-        media_stream_constraints={
-            "video": True,
-            "audio": False
-        },
-        video_processor_factory=PoseVideoProcessor,
-        async_processing=True,
-    )
+    if camera_source == "目前裝置鏡頭":
+        st.info(f"目前使用：{camera_choice}")
+
+        webrtc_streamer(
+            key=f"pose-monitor-{facing_mode}",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration={
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]},
+                    {"urls": ["stun:stun1.l.google.com:19302"]},
+                    {"urls": ["stun:stun2.l.google.com:19302"]},
+                    {"urls": ["stun:stun3.l.google.com:19302"]},
+                    {"urls": ["stun:stun4.l.google.com:19302"]}
+                ]
+            },
+            media_stream_constraints={
+                "video": {
+                    "facingMode": {"ideal": facing_mode},
+                    "width": {"ideal": 640, "max": 960},
+                    "height": {"ideal": 480, "max": 720},
+                    "frameRate": {"ideal": 10, "max": 15},
+                },
+                "audio": False
+            },
+            video_processor_factory=PoseVideoProcessor,
+            async_processing=True,
+        )
+
+    else:
+        st.info("目前使用：其他裝置攝影機 URL")
+
+        st.markdown(
+            """
+            可輸入其他攝影機串流網址，例如 IP Camera、ngrok、Cloudflare Tunnel 或公開 RTSP/HTTP 串流。
+            
+            注意：如果網址是 `192.168.x.x`、`localhost`、`127.0.0.1`，
+            Railway 通常無法讀取，因為那是你的本地區網。
+            """
+        )
+
+        if camera_url.strip() == "":
+            st.warning("請先在左側輸入攝影機串流網址。")
+
+        else:
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                if st.button("▶️ 讀取其他裝置攝影機", type="primary"):
+                    st.session_state.external_camera_running = True
+
+            with col_b:
+                if st.button("⏹ 停止讀取外部攝影機"):
+                    st.session_state.external_camera_running = False
+
+            frame_placeholder = st.empty()
+
+            if st.session_state.external_camera_running:
+                cap = cv2.VideoCapture(camera_url)
+
+                if not cap.isOpened():
+                    st.error("無法連線到攝影機。請確認網址是否正確，且 Railway 可以連到該網址。")
+                    st.session_state.external_camera_running = False
+
+                else:
+                    st.success("已連線到外部攝影機，正在讀取影像。")
+
+                    # 每次執行讀取一小段，避免 Streamlit 長時間卡死
+                    for _ in range(80):
+                        if not st.session_state.external_camera_running:
+                            break
+
+                        ret, frame = cap.read()
+
+                        if not ret:
+                            st.warning("讀取不到影像，串流可能中斷。")
+                            st.session_state.external_camera_running = False
+                            break
+
+                        annotated = process_image_frame(frame)
+                        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+                        frame_placeholder.image(
+                            annotated_rgb,
+                            channels="RGB",
+                            use_container_width=True
+                        )
+
+                        time.sleep(0.08)
+
+                    cap.release()
 
 
 # =========================
@@ -643,3 +783,21 @@ with right_col:
             ✅ 目前尚未觸發警報
         </div>
         """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    st.subheader("4. 使用提醒")
+
+    st.markdown(
+        """
+        **目前裝置鏡頭模式：**
+        - 適合直接用手機或電腦打開網頁。
+        - 可選擇前鏡頭或後鏡頭。
+        - 後鏡頭解析度較高，程式已自動縮小影像以提升穩定度。
+
+        **其他裝置攝影機 URL 模式：**
+        - 可輸入公開的攝影機串流網址。
+        - Railway 通常無法讀取 `192.168.x.x` 這種區網網址。
+        - 如果要用另一支手機當攝影機，通常需要 ngrok 或 Cloudflare Tunnel 轉成公開網址。
+        """
+    )
