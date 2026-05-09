@@ -11,7 +11,6 @@ from pathlib import Path
 
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
-from streamlit_autorefresh import st_autorefresh
 
 
 # =========================
@@ -397,9 +396,6 @@ st.sidebar.info(
     "按下 Start 後開始監測；Stop 會停止並重新計算。"
 )
 
-
-# 每秒刷新右側資訊
-st_autorefresh(interval=1000, key="refresh")
 
 
 # =========================
