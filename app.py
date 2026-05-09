@@ -1,38 +1,126 @@
-import os
+import streamlit as st
+import streamlit.components.v1 as components
+
 import cv2
 import math
+import av
 import time
-import base64
 import threading
-from io import BytesIO
+import base64
+from pathlib import Path
 
-import numpy as np
-import qrcode
 from ultralytics import YOLO
-
-from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
+from streamlit_autorefresh import st_autorefresh
 
 
 # =========================
-# FastAPI app
+# Page config
 # =========================
-app = FastAPI(title="長照睡姿固定過久警報系統")
+st.set_page_config(
+    page_title="長照睡姿固定過久警報系統",
+    page_icon="🛌",
+    layout="wide"
+)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+
+# =========================
+# Custom style
+# =========================
+st.markdown("""
+<style>
+
+.main-title {
+    font-size: 2.2rem;
+    font-weight: 700;
+    color: #1f3c88;
+    margin-bottom: 0.2rem;
+}
+
+.sub-text {
+    color: #5f6b7a;
+    font-size: 1rem;
+    margin-bottom: 1.2rem;
+}
+
+.metric-card {
+    background-color: #f8fbff;
+    border: 1px solid #dfe8f3;
+    border-radius: 14px;
+    padding: 16px 20px;
+    text-align: center;
+}
+
+.metric-label {
+    font-size: 0.95rem;
+    color: #6b7280;
+}
+
+.metric-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #1f3c88;
+}
+
+.alert-box {
+    background-color: #fff1f2;
+    border: 1px solid #fda4af;
+    color: #b91c1c;
+    border-radius: 12px;
+    padding: 16px;
+    font-size: 1.05rem;
+    font-weight: 600;
+}
+
+.normal-box {
+    background-color: #f0fdf4;
+    border: 1px solid #86efac;
+    color: #166534;
+    border-radius: 12px;
+    padding: 16px;
+    font-size: 1.05rem;
+    font-weight: 600;
+}
+
+.sound-box {
+    background-color: #fff7ed;
+    border: 1px solid #fdba74;
+    color: #9a3412;
+    border-radius: 12px;
+    padding: 14px;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-top: 10px;
+    margin-bottom: 10px;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================
+# Title
+# =========================
+st.markdown(
+    '<div class="main-title">🛌 長照睡姿固定過久警報系統</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="sub-text">使用影像分析臥床姿勢變化，協助照護員及早發現長時間未翻身狀況。</div>',
+    unsafe_allow_html=True
 )
 
 
 # =========================
 # Load YOLO model
 # =========================
-model = YOLO("yolov8n-pose.pt")
+@st.cache_resource
+def load_model():
+    return YOLO("yolov8n-pose.pt")
+
+
+model = load_model()
 
 
 # =========================
@@ -42,8 +130,8 @@ class AppState:
     def __init__(self):
         self.lock = threading.Lock()
 
-        self.current_posture = "尚未偵測"
-        self.last_posture = "尚未偵測"
+        self.current_posture = "無人躺著"
+        self.last_posture = "無人躺著"
 
         self.start_time = time.time()
         self.duration = 0.0
@@ -52,34 +140,26 @@ class AppState:
         self.alarm_acknowledged = False
 
         self.monitoring = False
-        self.alarm_threshold = 10
-
-        self.latest_image_base64 = ""
-        self.last_update_time = ""
 
 
-state = AppState()
+if "shared_state" not in st.session_state:
+    st.session_state.shared_state = AppState()
+
+shared_state = st.session_state.shared_state
+
+if "sound_enabled" not in st.session_state:
+    st.session_state.sound_enabled = False
+
+if "test_alarm_sound" not in st.session_state:
+    st.session_state.test_alarm_sound = False
+
+if "external_camera_running" not in st.session_state:
+    st.session_state.external_camera_running = False
 
 
 # =========================
-# Helper functions
+# Helper
 # =========================
-def get_base_url(request: Request):
-    """
-    Railway 通常會透過反向代理轉發，所以用 header 判斷公開網址。
-    如果你有在 Railway 設定 PUBLIC_APP_URL，也會優先使用。
-    """
-    public_url = os.getenv("PUBLIC_APP_URL", "").strip()
-
-    if public_url:
-        return public_url.rstrip("/")
-
-    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("host", "")
-
-    return f"{proto}://{host}".rstrip("/")
-
-
 def to_xy(point):
     return float(point[0]), float(point[1])
 
@@ -87,10 +167,18 @@ def to_xy(point):
 def dist(p1, p2):
     x1, y1 = to_xy(p1)
     x2, y2 = to_xy(p2)
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+    return math.sqrt(
+        (x1 - x2) ** 2 +
+        (y1 - y2) ** 2
+    )
 
 
 def resize_frame(img, max_width=640):
+    """
+    手機後鏡頭或外部攝影機解析度可能太高，
+    先縮小再丟進 YOLO，避免 Railway 跑太慢或卡住。
+    """
     h, w = img.shape[:2]
 
     if w > max_width:
@@ -176,9 +264,192 @@ def classify_posture(results):
 
 
 # =========================
-# Process image
+# Alarm sound
+# =========================
+def render_loop_alarm():
+    audio_file = Path("alarm.mp3")
+
+    if not audio_file.exists():
+        st.warning("⚠️ 找不到 alarm.mp3，請確認 alarm.mp3 有放在 app.py 同一層。")
+        return
+
+    audio_bytes = audio_file.read_bytes()
+    b64 = base64.b64encode(audio_bytes).decode()
+
+    st.markdown(
+        """
+        <div class="sound-box">
+            🔊 警報聲已觸發。若瀏覽器沒有自動播放，請按下方「播放警報聲」按鈕。
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    audio_html = f"""
+    <div style="margin-top: 12px;">
+        <audio id="alarmAudio" loop>
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+            你的瀏覽器不支援音訊播放。
+        </audio>
+
+        <button onclick="playAlarm()" 
+            style="
+                background-color:#dc2626;
+                color:white;
+                border:none;
+                border-radius:10px;
+                padding:12px 20px;
+                font-size:18px;
+                font-weight:700;
+                cursor:pointer;
+                margin-right:10px;
+            ">
+            🔊 播放警報聲
+        </button>
+
+        <button onclick="stopAlarm()" 
+            style="
+                background-color:#4b5563;
+                color:white;
+                border:none;
+                border-radius:10px;
+                padding:12px 20px;
+                font-size:18px;
+                font-weight:700;
+                cursor:pointer;
+            ">
+            ⏹ 停止警報聲
+        </button>
+
+        <script>
+            const audio = document.getElementById("alarmAudio");
+
+            function playAlarm() {{
+                audio.currentTime = 0;
+                audio.play();
+            }}
+
+            function stopAlarm() {{
+                audio.pause();
+                audio.currentTime = 0;
+            }}
+
+            audio.play().catch(function(error) {{
+                console.log("Autoplay was blocked by browser.");
+            }});
+        </script>
+    </div>
+    """
+
+    components.html(audio_html, height=100)
+
+
+# =========================
+# Sidebar
+# =========================
+st.sidebar.header("⚙️ 分析設定")
+
+camera_source = st.sidebar.radio(
+    "選擇攝影機來源",
+    ["目前裝置鏡頭", "其他裝置攝影機 URL"],
+    index=0
+)
+
+camera_choice = "後鏡頭"
+facing_mode = "environment"
+
+if camera_source == "目前裝置鏡頭":
+    camera_choice = st.sidebar.radio(
+        "選擇鏡頭",
+        ["前鏡頭", "後鏡頭"],
+        index=1
+    )
+
+    if camera_choice == "前鏡頭":
+        facing_mode = "user"
+    else:
+        facing_mode = "environment"
+
+camera_url = ""
+
+if camera_source == "其他裝置攝影機 URL":
+    camera_url = st.sidebar.text_input(
+        "請輸入攝影機串流網址",
+        placeholder="例如：https://xxxx.ngrok-free.app/video 或 rtsp://..."
+    )
+
+st.sidebar.markdown("---")
+
+alarm_threshold = st.sidebar.slider(
+    "同姿勢維持幾秒觸發警報",
+    min_value=3,
+    max_value=60,
+    value=10,
+    step=1
+)
+
+if st.sidebar.button("🔊 啟用警報聲"):
+    st.session_state.sound_enabled = True
+    st.sidebar.success("警報聲已啟用")
+
+if st.sidebar.button("🔔 測試警報聲"):
+    st.session_state.sound_enabled = True
+    st.session_state.test_alarm_sound = True
+
+st.sidebar.markdown("---")
+
+
+# =========================
+# Start button
+# =========================
+if st.sidebar.button("▶️ Start"):
+    with shared_state.lock:
+        shared_state.monitoring = True
+        shared_state.start_time = time.time()
+        shared_state.duration = 0.0
+        shared_state.alarm = False
+        shared_state.alarm_acknowledged = False
+        shared_state.last_posture = shared_state.current_posture
+
+
+# =========================
+# Stop button
+# =========================
+if st.sidebar.button("⏹ Stop"):
+    with shared_state.lock:
+        shared_state.monitoring = False
+        shared_state.duration = 0.0
+        shared_state.alarm = False
+        shared_state.alarm_acknowledged = False
+        shared_state.current_posture = "無人躺著"
+        shared_state.last_posture = "無人躺著"
+
+    st.session_state.test_alarm_sound = False
+    st.session_state.external_camera_running = False
+
+st.sidebar.markdown("---")
+
+st.sidebar.info(
+    "按下 Start 後開始監測；Stop 會停止並重新計算。"
+)
+
+if camera_source == "其他裝置攝影機 URL":
+    st.sidebar.warning(
+        "提醒：Railway 無法直接連到 192.168.x.x、localhost 這類區網網址。"
+    )
+
+
+# 每秒刷新右側資訊
+st_autorefresh(interval=1000, key="refresh")
+
+
+# =========================
+# 共用影像處理邏輯
 # =========================
 def process_image_frame(img):
+    """
+    WebRTC 和其他裝置攝影機 URL 共用這個函式。
+    """
     img = resize_frame(img, max_width=640)
 
     try:
@@ -203,59 +474,65 @@ def process_image_frame(img):
 
     now = time.time()
 
-    with state.lock:
-        if state.monitoring:
-            if current_posture == state.last_posture:
-                state.duration = now - state.start_time
+    with shared_state.lock:
+        if shared_state.monitoring:
+            if current_posture == shared_state.last_posture:
+                shared_state.duration = now - shared_state.start_time
 
             else:
-                state.last_posture = current_posture
-                state.current_posture = current_posture
-                state.start_time = now
-                state.duration = 0.0
-                state.alarm = False
-                state.alarm_acknowledged = False
+                shared_state.last_posture = current_posture
+                shared_state.current_posture = current_posture
+                shared_state.start_time = now
+                shared_state.duration = 0.0
+                shared_state.alarm = False
+                shared_state.alarm_acknowledged = False
 
             if (
-                state.duration >= state.alarm_threshold
+                shared_state.duration >= alarm_threshold
                 and current_posture != "無人躺著"
                 and current_posture != "偵測錯誤"
-                and not state.alarm_acknowledged
+                and not shared_state.alarm_acknowledged
             ):
-                state.alarm = True
+                shared_state.alarm = True
 
             else:
                 if (
                     current_posture == "無人躺著"
                     or current_posture == "偵測錯誤"
-                    or state.alarm_acknowledged
+                    or shared_state.alarm_acknowledged
                 ):
-                    state.alarm = False
+                    shared_state.alarm = False
 
-            state.current_posture = current_posture
+            shared_state.current_posture = current_posture
 
         else:
-            state.duration = 0.0
-            state.alarm = False
-            state.current_posture = current_posture
+            shared_state.duration = 0.0
+            shared_state.alarm = False
+            shared_state.current_posture = current_posture
 
-        monitor_text = "Monitoring" if state.monitoring else "Stopped"
+        monitor_text = (
+            "Monitoring"
+            if shared_state.monitoring
+            else "Stopped"
+        )
 
         posture_map = {
             "無人躺著": "No person",
             "左側躺": "Left side",
             "右側躺": "Right side",
             "仰躺": "Supine",
-            "偵測錯誤": "Error",
-            "尚未偵測": "Not detected"
+            "偵測錯誤": "Error"
         }
 
-        posture_en = posture_map.get(state.current_posture, "Unknown")
+        posture_en = posture_map.get(
+            shared_state.current_posture,
+            "Unknown"
+        )
 
         info_text = (
             f"{monitor_text} | "
             f"Posture: {posture_en} | "
-            f"Time: {int(state.duration)} sec"
+            f"Time: {int(shared_state.duration)} sec"
         )
 
         cv2.rectangle(
@@ -277,7 +554,7 @@ def process_image_frame(img):
             cv2.LINE_AA
         )
 
-        if state.alarm:
+        if shared_state.alarm:
             cv2.rectangle(
                 annotated,
                 (0, 0),
@@ -289,9 +566,9 @@ def process_image_frame(img):
             cv2.putText(
                 annotated,
                 "ALARM",
-                (30, 115),
+                (30, 110),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1.7,
+                1.5,
                 (0, 0, 255),
                 4,
                 cv2.LINE_AA
@@ -300,649 +577,227 @@ def process_image_frame(img):
     return annotated
 
 
-def image_to_base64(img):
-    ok, buffer = cv2.imencode(".jpg", img)
-
-    if not ok:
-        return ""
-
-    return base64.b64encode(buffer).decode("utf-8")
-
-
-def generate_qr_png(url):
-    qr = qrcode.QRCode(
-        version=1,
-        box_size=8,
-        border=2
-    )
-    qr.add_data(url)
-    qr.make(fit=True)
-
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    buffer.seek(0)
-
-    return buffer.getvalue()
-
-
 # =========================
-# Routes
+# Video Processor
 # =========================
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return """
-    <html>
-        <head>
-            <meta http-equiv="refresh" content="0; url=/dashboard">
-        </head>
-        <body>
-            <p>Redirecting to dashboard...</p>
-        </body>
-    </html>
-    """
-
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    base_url = get_base_url(request)
-    camera_url = f"{base_url}/camera"
-
-    return f"""
-    <!DOCTYPE html>
-    <html lang="zh-Hant">
-    <head>
-        <meta charset="UTF-8">
-        <title>長照睡姿固定過久警報系統 Dashboard</title>
-        <style>
-            body {{
-                margin: 0;
-                font-family: Arial, "Microsoft JhengHei", sans-serif;
-                background: #f5f7fb;
-                color: #1f2937;
-            }}
-
-            .container {{
-                max-width: 1200px;
-                margin: 0 auto;
-                padding: 24px;
-            }}
-
-            .title {{
-                font-size: 32px;
-                font-weight: 800;
-                color: #1f3c88;
-                margin-bottom: 6px;
-            }}
-
-            .subtitle {{
-                color: #64748b;
-                margin-bottom: 24px;
-            }}
-
-            .grid {{
-                display: grid;
-                grid-template-columns: 1.2fr 0.8fr;
-                gap: 24px;
-            }}
-
-            .card {{
-                background: white;
-                border-radius: 18px;
-                padding: 20px;
-                box-shadow: 0 10px 25px rgba(15, 23, 42, 0.08);
-                border: 1px solid #e5e7eb;
-            }}
-
-            .video-box {{
-                width: 100%;
-                background: #111827;
-                border-radius: 16px;
-                min-height: 420px;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                overflow: hidden;
-            }}
-
-            #latestImage {{
-                max-width: 100%;
-                width: 100%;
-                border-radius: 16px;
-            }}
-
-            .metrics {{
-                display: grid;
-                grid-template-columns: repeat(3, 1fr);
-                gap: 12px;
-                margin-bottom: 18px;
-            }}
-
-            .metric {{
-                background: #f8fbff;
-                border: 1px solid #dfe8f3;
-                border-radius: 14px;
-                padding: 16px;
-                text-align: center;
-            }}
-
-            .metric-label {{
-                color: #64748b;
-                font-size: 14px;
-                margin-bottom: 8px;
-            }}
-
-            .metric-value {{
-                color: #1f3c88;
-                font-size: 24px;
-                font-weight: 800;
-            }}
-
-            button {{
-                border: none;
-                border-radius: 12px;
-                padding: 12px 18px;
-                font-size: 16px;
-                font-weight: 700;
-                cursor: pointer;
-                margin: 4px;
-            }}
-
-            .start {{
-                background: #2563eb;
-                color: white;
-            }}
-
-            .stop {{
-                background: #475569;
-                color: white;
-            }}
-
-            .ack {{
-                background: #16a34a;
-                color: white;
-            }}
-
-            .alert {{
-                background: #fff1f2;
-                border: 1px solid #fda4af;
-                color: #b91c1c;
-                border-radius: 12px;
-                padding: 16px;
-                font-size: 18px;
-                font-weight: 700;
-                margin-top: 14px;
-            }}
-
-            .normal {{
-                background: #f0fdf4;
-                border: 1px solid #86efac;
-                color: #166534;
-                border-radius: 12px;
-                padding: 16px;
-                font-size: 18px;
-                font-weight: 700;
-                margin-top: 14px;
-            }}
-
-            .qr {{
-                width: 220px;
-                border: 1px solid #e5e7eb;
-                border-radius: 14px;
-                padding: 8px;
-                background: white;
-            }}
-
-            input {{
-                padding: 10px;
-                border: 1px solid #cbd5e1;
-                border-radius: 10px;
-                font-size: 16px;
-                width: 80px;
-            }}
-
-            .hint {{
-                color: #64748b;
-                font-size: 14px;
-                line-height: 1.6;
-            }}
-
-            @media (max-width: 900px) {{
-                .grid {{
-                    grid-template-columns: 1fr;
-                }}
-
-                .metrics {{
-                    grid-template-columns: 1fr;
-                }}
-            }}
-        </style>
-    </head>
-
-    <body>
-        <div class="container">
-            <div class="title">🛌 長照睡姿固定過久警報系統</div>
-            <div class="subtitle">電腦端 Dashboard：顯示 iPhone 傳回的畫面與姿勢偵測結果</div>
-
-            <div class="grid">
-                <div class="card">
-                    <h2>1. 即時影像</h2>
-                    <div class="video-box">
-                        <img id="latestImage" src="" alt="尚未收到手機影像">
-                    </div>
-                    <p class="hint">請用 iPhone 掃描右側 QR Code，進入攝影機頁面後按「開始傳送」。</p>
-                </div>
-
-                <div class="card">
-                    <h2>2. 手機攝影機連線</h2>
-                    <img class="qr" src="/qr.png" alt="QR Code">
-                    <p class="hint">
-                        掃描後會開啟：<br>
-                        <b>{camera_url}</b>
-                    </p>
-
-                    <hr>
-
-                    <h2>3. 控制面板</h2>
-
-                    <label>警報秒數：</label>
-                    <input id="thresholdInput" type="number" min="3" max="120" value="10">
-                    <button onclick="updateThreshold()" class="start">更新秒數</button>
-
-                    <br><br>
-
-                    <button onclick="startMonitoring()" class="start">▶️ Start</button>
-                    <button onclick="stopMonitoring()" class="stop">⏹ Stop</button>
-                    <button onclick="ackAlarm()" class="ack">✅ 確認警報</button>
-
-                    <hr>
-
-                    <h2>4. 摘要資訊</h2>
-
-                    <div class="metrics">
-                        <div class="metric">
-                            <div class="metric-label">目前姿勢</div>
-                            <div id="posture" class="metric-value">尚未偵測</div>
-                        </div>
-
-                        <div class="metric">
-                            <div class="metric-label">持續時間</div>
-                            <div id="duration" class="metric-value">0 秒</div>
-                        </div>
-
-                        <div class="metric">
-                            <div class="metric-label">系統狀態</div>
-                            <div id="monitoring" class="metric-value">停止</div>
-                        </div>
-                    </div>
-
-                    <div id="alarmBox" class="normal">✅ 目前尚未觸發警報</div>
-
-                    <audio id="alarmAudio" src="/alarm.mp3" loop></audio>
-                </div>
-            </div>
-        </div>
-
-        <script>
-            async function fetchState() {{
-                try {{
-                    const res = await fetch("/state");
-                    const data = await res.json();
-
-                    document.getElementById("posture").innerText = data.current_posture;
-                    document.getElementById("duration").innerText = data.duration + " 秒";
-                    document.getElementById("monitoring").innerText = data.monitoring ? "監測中" : "停止";
-                    document.getElementById("thresholdInput").value = data.alarm_threshold;
-
-                    if (data.latest_image_base64) {{
-                        document.getElementById("latestImage").src =
-                            "data:image/jpeg;base64," + data.latest_image_base64;
-                    }}
-
-                    const alarmBox = document.getElementById("alarmBox");
-                    const alarmAudio = document.getElementById("alarmAudio");
-
-                    if (data.alarm) {{
-                        alarmBox.className = "alert";
-                        alarmBox.innerText = "🚨 偵測到同一姿勢維持過久，請協助翻身";
-
-                        alarmAudio.play().catch(() => {{
-                            console.log("Autoplay blocked.");
-                        }});
-                    }} else {{
-                        alarmBox.className = "normal";
-                        alarmBox.innerText = "✅ 目前尚未觸發警報";
-                        alarmAudio.pause();
-                        alarmAudio.currentTime = 0;
-                    }}
-
-                }} catch (err) {{
-                    console.log(err);
-                }}
-            }}
-
-            async function startMonitoring() {{
-                await fetch("/control", {{
-                    method: "POST",
-                    headers: {{ "Content-Type": "application/json" }},
-                    body: JSON.stringify({{ action: "start" }})
-                }});
-                fetchState();
-            }}
-
-            async function stopMonitoring() {{
-                await fetch("/control", {{
-                    method: "POST",
-                    headers: {{ "Content-Type": "application/json" }},
-                    body: JSON.stringify({{ action: "stop" }})
-                }});
-                fetchState();
-            }}
-
-            async function ackAlarm() {{
-                await fetch("/control", {{
-                    method: "POST",
-                    headers: {{ "Content-Type": "application/json" }},
-                    body: JSON.stringify({{ action: "ack" }})
-                }});
-                fetchState();
-            }}
-
-            async function updateThreshold() {{
-                const threshold = parseInt(document.getElementById("thresholdInput").value);
-
-                await fetch("/control", {{
-                    method: "POST",
-                    headers: {{ "Content-Type": "application/json" }},
-                    body: JSON.stringify({{
-                        action: "threshold",
-                        alarm_threshold: threshold
-                    }})
-                }});
-
-                fetchState();
-            }}
-
-            setInterval(fetchState, 1000);
-            fetchState();
-        </script>
-    </body>
-    </html>
-    """
-
-
-@app.get("/camera", response_class=HTMLResponse)
-async def camera_page():
-    return """
-    <!DOCTYPE html>
-    <html lang="zh-Hant">
-    <head>
-        <meta charset="UTF-8">
-        <title>手機攝影機端</title>
-        <style>
-            body {
-                margin: 0;
-                font-family: Arial, "Microsoft JhengHei", sans-serif;
-                background: #0f172a;
-                color: white;
-                text-align: center;
-            }
-
-            .container {
-                padding: 20px;
-            }
-
-            h1 {
-                font-size: 28px;
-                margin-bottom: 8px;
-            }
-
-            p {
-                color: #cbd5e1;
-                line-height: 1.6;
-            }
-
-            video {
-                width: 100%;
-                max-width: 520px;
-                border-radius: 18px;
-                background: black;
-                margin-top: 16px;
-            }
-
-            button {
-                border: none;
-                border-radius: 14px;
-                padding: 14px 22px;
-                font-size: 18px;
-                font-weight: 800;
-                cursor: pointer;
-                margin: 8px;
-            }
-
-            .start {
-                background: #22c55e;
-                color: white;
-            }
-
-            .stop {
-                background: #ef4444;
-                color: white;
-            }
-
-            .status {
-                margin-top: 16px;
-                padding: 14px;
-                border-radius: 12px;
-                background: #1e293b;
-                color: #e2e8f0;
-            }
-        </style>
-    </head>
-
-    <body>
-        <div class="container">
-            <h1>📱 手機攝影機端</h1>
-            <p>
-                請允許使用相機，並將手機後鏡頭對準病床或模擬畫面。<br>
-                這個頁面會定時把影像傳回電腦 Dashboard。
-            </p>
-
-            <video id="video" autoplay playsinline muted></video>
-
-            <br>
-
-            <button class="start" onclick="startCamera()">▶️ 開始傳送</button>
-            <button class="stop" onclick="stopCamera()">⏹ 停止傳送</button>
-
-            <div id="status" class="status">尚未開始</div>
-
-            <canvas id="canvas" style="display:none;"></canvas>
-        </div>
-
-        <script>
-            let video = document.getElementById("video");
-            let canvas = document.getElementById("canvas");
-            let statusBox = document.getElementById("status");
-
-            let stream = null;
-            let sending = false;
-            let timer = null;
-
-            async function startCamera() {
-                try {
-                    stream = await navigator.mediaDevices.getUserMedia({
-                        video: {
-                            facingMode: { ideal: "environment" },
-                            width: { ideal: 640, max: 960 },
-                            height: { ideal: 480, max: 720 },
-                            frameRate: { ideal: 10, max: 15 }
-                        },
-                        audio: false
-                    });
-
-                    video.srcObject = stream;
-                    sending = true;
-
-                    statusBox.innerText = "✅ 已開啟相機，正在傳送影像到 Dashboard";
-
-                    timer = setInterval(captureAndSend, 800);
-
-                } catch (err) {
-                    statusBox.innerText = "❌ 無法開啟相機：" + err;
-                }
-            }
-
-            function stopCamera() {
-                sending = false;
-
-                if (timer) {
-                    clearInterval(timer);
-                    timer = null;
-                }
-
-                if (stream) {
-                    stream.getTracks().forEach(track => track.stop());
-                    stream = null;
-                }
-
-                video.srcObject = null;
-                statusBox.innerText = "已停止傳送";
-            }
-
-            async function captureAndSend() {
-                if (!sending || !video.videoWidth) {
-                    return;
-                }
-
-                const maxWidth = 640;
-                const scale = maxWidth / video.videoWidth;
-                const width = maxWidth;
-                const height = Math.round(video.videoHeight * scale);
-
-                canvas.width = width;
-                canvas.height = height;
-
-                const ctx = canvas.getContext("2d");
-                ctx.drawImage(video, 0, 0, width, height);
-
-                canvas.toBlob(async function(blob) {
-                    if (!blob) return;
-
-                    const formData = new FormData();
-                    formData.append("file", blob, "frame.jpg");
-
-                    try {
-                        const res = await fetch("/upload", {
-                            method: "POST",
-                            body: formData
-                        });
-
-                        if (res.ok) {
-                            statusBox.innerText = "✅ 影像傳送中：" + new Date().toLocaleTimeString();
-                        } else {
-                            statusBox.innerText = "⚠️ 傳送失敗";
-                        }
-
-                    } catch (err) {
-                        statusBox.innerText = "❌ 傳送錯誤：" + err;
-                    }
-
-                }, "image/jpeg", 0.7);
-            }
-        </script>
-    </body>
-    </html>
-    """
-
-
-@app.get("/qr.png")
-async def qr_png(request: Request):
-    base_url = get_base_url(request)
-    camera_url = f"{base_url}/camera"
-
-    png = generate_qr_png(camera_url)
-
-    return Response(content=png, media_type="image/png")
-
-
-@app.post("/upload")
-async def upload_frame(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-
-    img_array = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-
-    if img is None:
-        return JSONResponse(
-            {"ok": False, "message": "無法讀取影像"},
-            status_code=400
+class PoseVideoProcessor(VideoProcessorBase):
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+
+        annotated = process_image_frame(img)
+
+        return av.VideoFrame.from_ndarray(
+            annotated,
+            format="bgr24"
         )
 
-    annotated = process_image_frame(img)
-    img_b64 = image_to_base64(annotated)
 
-    with state.lock:
-        state.latest_image_base64 = img_b64
-        state.last_update_time = time.strftime("%Y-%m-%d %H:%M:%S")
-
-    return {"ok": True}
+# =========================
+# Layout
+# =========================
+left_col, right_col = st.columns([1.15, 1.4])
 
 
-@app.get("/state")
-async def get_state():
-    with state.lock:
-        return {
-            "current_posture": state.current_posture,
-            "last_posture": state.last_posture,
-            "duration": int(state.duration),
-            "alarm": state.alarm,
-            "alarm_acknowledged": state.alarm_acknowledged,
-            "monitoring": state.monitoring,
-            "alarm_threshold": state.alarm_threshold,
-            "latest_image_base64": state.latest_image_base64,
-            "last_update_time": state.last_update_time,
-        }
+# =========================
+# Camera Panel
+# =========================
+with left_col:
+    st.subheader("1. 即時影像監測")
+
+    if camera_source == "目前裝置鏡頭":
+        st.info(f"目前使用：{camera_choice}")
+
+        webrtc_streamer(
+            key=f"pose-monitor-{facing_mode}",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration={
+                "iceServers": [
+                    {"urls": ["stun:stun.l.google.com:19302"]},
+                    {"urls": ["stun:stun1.l.google.com:19302"]},
+                    {"urls": ["stun:stun2.l.google.com:19302"]},
+                    {"urls": ["stun:stun3.l.google.com:19302"]},
+                    {"urls": ["stun:stun4.l.google.com:19302"]}
+                ]
+            },
+            media_stream_constraints={
+                "video": {
+                    "facingMode": {"ideal": facing_mode},
+                    "width": {"ideal": 640, "max": 960},
+                    "height": {"ideal": 480, "max": 720},
+                    "frameRate": {"ideal": 10, "max": 15},
+                },
+                "audio": False
+            },
+            video_processor_factory=PoseVideoProcessor,
+            async_processing=True,
+        )
+
+    else:
+        st.info("目前使用：其他裝置攝影機 URL")
+
+        st.markdown(
+            """
+            可輸入其他攝影機串流網址，例如 IP Camera、ngrok、Cloudflare Tunnel 或公開 RTSP/HTTP 串流。
+            
+            注意：如果網址是 `192.168.x.x`、`localhost`、`127.0.0.1`，
+            Railway 通常無法讀取，因為那是你的本地區網。
+            """
+        )
+
+        if camera_url.strip() == "":
+            st.warning("請先在左側輸入攝影機串流網址。")
+
+        else:
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                if st.button("▶️ 讀取其他裝置攝影機", type="primary"):
+                    st.session_state.external_camera_running = True
+
+            with col_b:
+                if st.button("⏹ 停止讀取外部攝影機"):
+                    st.session_state.external_camera_running = False
+
+            frame_placeholder = st.empty()
+
+            if st.session_state.external_camera_running:
+                cap = cv2.VideoCapture(camera_url)
+
+                if not cap.isOpened():
+                    st.error("無法連線到攝影機。請確認網址是否正確，且 Railway 可以連到該網址。")
+                    st.session_state.external_camera_running = False
+
+                else:
+                    st.success("已連線到外部攝影機，正在讀取影像。")
+
+                    # 每次執行讀取一小段，避免 Streamlit 長時間卡死
+                    for _ in range(80):
+                        if not st.session_state.external_camera_running:
+                            break
+
+                        ret, frame = cap.read()
+
+                        if not ret:
+                            st.warning("讀取不到影像，串流可能中斷。")
+                            st.session_state.external_camera_running = False
+                            break
+
+                        annotated = process_image_frame(frame)
+                        annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+
+                        frame_placeholder.image(
+                            annotated_rgb,
+                            channels="RGB",
+                            use_container_width=True
+                        )
+
+                        time.sleep(0.08)
+
+                    cap.release()
 
 
-@app.post("/control")
-async def control(payload: dict):
-    action = payload.get("action", "")
+# =========================
+# Right Panel
+# =========================
+with right_col:
+    st.subheader("2. 摘要資訊")
 
-    with state.lock:
-        if action == "start":
-            state.monitoring = True
-            state.start_time = time.time()
-            state.duration = 0.0
-            state.alarm = False
-            state.alarm_acknowledged = False
-            state.last_posture = state.current_posture
+    with shared_state.lock:
+        posture_now = shared_state.current_posture
+        duration_now = int(shared_state.duration)
+        alarm_now = shared_state.alarm
+        monitoring_now = shared_state.monitoring
 
-        elif action == "stop":
-            state.monitoring = False
-            state.duration = 0.0
-            state.alarm = False
-            state.alarm_acknowledged = False
-            state.current_posture = "尚未偵測"
-            state.last_posture = "尚未偵測"
+    c1, c2, c3 = st.columns(3)
 
-        elif action == "ack":
-            state.alarm_acknowledged = True
-            state.alarm = False
+    with c1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">目前姿勢</div>
+            <div class="metric-value">{posture_now}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-        elif action == "threshold":
-            threshold = int(payload.get("alarm_threshold", 10))
-            threshold = max(3, min(120, threshold))
-            state.alarm_threshold = threshold
+    with c2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">持續時間</div>
+            <div class="metric-value">{duration_now} 秒</div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    return {"ok": True}
+    with c3:
+        system_text = (
+            "監測中"
+            if monitoring_now
+            else "停止"
+        )
+
+        st.markdown(f"""
+        <div class="metric-card">
+            <div class="metric-label">系統狀態</div>
+            <div class="metric-value">{system_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
 
-@app.get("/alarm.mp3")
-async def alarm_mp3():
-    path = "alarm.mp3"
+    # =========================
+    # 測試警報聲
+    # =========================
+    if st.session_state.test_alarm_sound:
+        st.subheader("🔔 警報聲測試")
+        render_loop_alarm()
 
-    if os.path.exists(path):
-        return FileResponse(path, media_type="audio/mpeg")
+        if st.button("停止測試警報聲"):
+            st.session_state.test_alarm_sound = False
+            st.rerun()
 
-    return Response(status_code=404)
+
+    # =========================
+    # Alarm 區
+    # =========================
+    st.subheader("3. 警報摘要")
+
+    if alarm_now:
+        st.markdown(f"""
+        <div class="alert-box">
+            🚨 偵測到姿勢持續超過 {alarm_threshold} 秒，
+            請協助翻身。
+        </div>
+        """, unsafe_allow_html=True)
+
+        render_loop_alarm()
+
+        if st.button("✅ 確認此資訊", type="primary"):
+            with shared_state.lock:
+                shared_state.alarm_acknowledged = True
+                shared_state.alarm = False
+
+            st.rerun()
+
+    else:
+        st.markdown("""
+        <div class="normal-box">
+            ✅ 目前尚未觸發警報
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    st.subheader("4. 使用提醒")
+
+    st.markdown(
+        """
+        **目前裝置鏡頭模式：**
+        - 適合直接用手機或電腦打開網頁。
+        - 可選擇前鏡頭或後鏡頭。
+        - 後鏡頭解析度較高，程式已自動縮小影像以提升穩定度。
+
+        **其他裝置攝影機 URL 模式：**
+        - 可輸入公開的攝影機串流網址。
+        - Railway 通常無法讀取 `192.168.x.x` 這種區網網址。
+        - 如果要用另一支手機當攝影機，通常需要 ngrok 或 Cloudflare Tunnel 轉成公開網址。
+        """
+    )
