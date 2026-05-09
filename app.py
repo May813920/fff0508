@@ -205,6 +205,24 @@ def resize_frame(img, max_width=640):
     return img
 
 
+def format_alarm_time(minutes, seconds):
+    """
+    將警報時間轉成好看的文字。
+    如果秒數是 0，就不顯示秒數。
+    """
+    if minutes > 0 and seconds > 0:
+        return f"{minutes} 分 {seconds} 秒"
+
+    elif minutes > 0 and seconds == 0:
+        return f"{minutes} 分"
+
+    elif minutes == 0 and seconds > 0:
+        return f"{seconds} 秒"
+
+    else:
+        return "1 秒"
+
+
 # =========================
 # 姿勢分類
 # =========================
@@ -365,13 +383,40 @@ def render_loop_alarm():
 # =========================
 st.sidebar.header("⚙️ 分析設定")
 
-alarm_threshold = st.sidebar.slider(
-    "同姿勢維持幾秒觸發警報",
-    min_value=3,
-    max_value=60,
+st.sidebar.subheader("⏰ 警報時間設定")
+
+alarm_minutes = st.sidebar.number_input(
+    "分鐘",
+    min_value=0,
+    max_value=120,
+    value=0,
+    step=1
+)
+
+alarm_seconds = st.sidebar.number_input(
+    "秒",
+    min_value=0,
+    max_value=59,
     value=10,
     step=1
 )
+
+# 將分鐘＋秒換算成總秒數，給程式判斷用
+alarm_threshold = alarm_minutes * 60 + alarm_seconds
+
+# 避免設定成 0 分 0 秒，造成警報立即觸發
+if alarm_threshold <= 0:
+    alarm_threshold = 1
+    alarm_time_text = "1 秒"
+    st.sidebar.warning("警報時間不能是 0，系統已自動改為 1 秒。")
+else:
+    alarm_time_text = format_alarm_time(alarm_minutes, alarm_seconds)
+
+st.sidebar.info(
+    f"目前設定：{alarm_time_text} 後觸發警報"
+)
+
+st.sidebar.markdown("---")
 
 if st.sidebar.button("🔊 啟用警報聲"):
     st.session_state.sound_enabled = True
@@ -743,7 +788,7 @@ with right_col:
     if alarm_now:
         st.markdown(f"""
         <div class="alert-box">
-            🚨 偵測到姿勢持續超過 {alarm_threshold} 秒，
+            🚨 偵測到姿勢持續超過 {alarm_time_text}，
             請協助翻身。
         </div>
         """, unsafe_allow_html=True)
@@ -772,7 +817,11 @@ with right_col:
 
     recorded_path = st.session_state.get("recorded_video_path")
 
-    if recorded_path is not None and Path(recorded_path).exists() and Path(recorded_path).stat().st_size > 0:
+    if (
+        recorded_path is not None
+        and Path(recorded_path).exists()
+        and Path(recorded_path).stat().st_size > 0
+    ):
         st.markdown(
             """
             <div class="record-box">
@@ -802,10 +851,11 @@ with right_col:
         """
         1. 開啟網頁後，請允許瀏覽器使用相機。  
         2. 按下左側 **Start** 開始即時姿勢監測。  
-        3. 若要錄影，按左側 **⏺ 開始錄影**。  
-        4. 錄影時畫面會顯示 **REC**。  
-        5. 按 **⏹ 停止錄影** 後，右側會出現下載按鈕。  
-        6. 若同一姿勢維持超過設定秒數，會觸發警報。  
-        7. 若使用 iPhone，警報聲可能需要手動按「播放警報聲」才會響。
+        3. 可在左側設定警報時間，例如 10 秒、1 分、1 分 30 秒。  
+        4. 若要錄影，按左側 **⏺ 開始錄影**。  
+        5. 錄影時畫面會顯示 **REC**。  
+        6. 按 **⏹ 停止錄影** 後，右側會出現下載按鈕。  
+        7. 若同一姿勢維持超過設定時間，會觸發警報。  
+        8. 若使用 iPhone，警報聲可能需要手動按「播放警報聲」才會響。
         """
     )
