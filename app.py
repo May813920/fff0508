@@ -93,6 +93,18 @@ st.markdown("""
     margin-bottom: 10px;
 }
 
+.record-box {
+    background-color: #eef6ff;
+    border: 1px solid #93c5fd;
+    color: #1e3a8a;
+    border-radius: 12px;
+    padding: 14px;
+    font-size: 1rem;
+    font-weight: 600;
+    margin-top: 10px;
+    margin-bottom: 10px;
+}
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -140,6 +152,12 @@ class AppState:
 
         self.monitoring = False
 
+        # 錄影相關
+        self.recording = False
+        self.record_writer = None
+        self.record_path = None
+        self.record_size = None
+
 
 if "shared_state" not in st.session_state:
     st.session_state.shared_state = AppState()
@@ -151,6 +169,9 @@ if "sound_enabled" not in st.session_state:
 
 if "test_alarm_sound" not in st.session_state:
     st.session_state.test_alarm_sound = False
+
+if "recorded_video_path" not in st.session_state:
+    st.session_state.recorded_video_path = None
 
 
 # =========================
@@ -392,10 +413,47 @@ if st.sidebar.button("⏹ Stop"):
 
 st.sidebar.markdown("---")
 
-st.sidebar.info(
-    "按下 Start 後開始監測；Stop 會停止並重新計算。"
-)
 
+# =========================
+# Recording buttons
+# =========================
+st.sidebar.subheader("🎥 錄影功能")
+
+if st.sidebar.button("⏺ 開始錄影"):
+    with shared_state.lock:
+        shared_state.recording = True
+        shared_state.record_path = f"/tmp/pose_record_{int(time.time())}.mp4"
+        shared_state.record_writer = None
+        shared_state.record_size = None
+
+    st.session_state.recorded_video_path = None
+    st.sidebar.success("已開始錄影")
+
+if st.sidebar.button("⏹ 停止錄影"):
+    with shared_state.lock:
+        shared_state.recording = False
+
+        if shared_state.record_writer is not None:
+            shared_state.record_writer.release()
+            shared_state.record_writer = None
+
+        st.session_state.recorded_video_path = shared_state.record_path
+
+    st.sidebar.success("已停止錄影，可在右側下載影片")
+
+with shared_state.lock:
+    recording_now = shared_state.recording
+
+if recording_now:
+    st.sidebar.warning("🔴 錄影中")
+else:
+    st.sidebar.info("目前未錄影")
+
+st.sidebar.markdown("---")
+
+st.sidebar.info(
+    "按下 Start 後開始監測；若要錄影，請再按「開始錄影」。"
+)
 
 
 # =========================
@@ -485,8 +543,10 @@ class PoseVideoProcessor(VideoProcessorBase):
                 "Unknown"
             )
 
+            record_text = " | REC" if shared_state.recording else ""
+
             info_text = (
-                f"{monitor_text} | "
+                f"{monitor_text}{record_text} | "
                 f"Posture: {posture_en} | "
                 f"Time: {int(shared_state.duration)} sec"
             )
@@ -510,6 +570,26 @@ class PoseVideoProcessor(VideoProcessorBase):
                 cv2.LINE_AA
             )
 
+            if shared_state.recording:
+                cv2.circle(
+                    annotated,
+                    (30, 95),
+                    10,
+                    (0, 0, 255),
+                    -1
+                )
+
+                cv2.putText(
+                    annotated,
+                    "REC",
+                    (50, 103),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                    cv2.LINE_AA
+                )
+
             if shared_state.alarm:
                 cv2.rectangle(
                     annotated,
@@ -522,13 +602,37 @@ class PoseVideoProcessor(VideoProcessorBase):
                 cv2.putText(
                     annotated,
                     "ALARM",
-                    (30, 110),
+                    (30, 135),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     1.5,
                     (0, 0, 255),
                     4,
                     cv2.LINE_AA
                 )
+
+            # =========================
+            # 錄影：寫入偵測後畫面
+            # =========================
+            if shared_state.recording:
+                h, w = annotated.shape[:2]
+
+                if (
+                    shared_state.record_writer is None
+                    or shared_state.record_size != (w, h)
+                ):
+                    shared_state.record_size = (w, h)
+
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+                    shared_state.record_writer = cv2.VideoWriter(
+                        shared_state.record_path,
+                        fourcc,
+                        10.0,
+                        (w, h)
+                    )
+
+                if shared_state.record_writer is not None:
+                    shared_state.record_writer.write(annotated)
 
         return av.VideoFrame.from_ndarray(
             annotated,
@@ -586,6 +690,7 @@ with right_col:
         duration_now = int(shared_state.duration)
         alarm_now = shared_state.alarm
         monitoring_now = shared_state.monitoring
+        recording_now = shared_state.recording
 
     c1, c2, c3 = st.columns(3)
 
@@ -606,11 +711,7 @@ with right_col:
         """, unsafe_allow_html=True)
 
     with c3:
-        system_text = (
-            "監測中"
-            if monitoring_now
-            else "停止"
-        )
+        system_text = "錄影中" if recording_now else ("監測中" if monitoring_now else "停止")
 
         st.markdown(f"""
         <div class="metric-card">
@@ -663,16 +764,48 @@ with right_col:
         </div>
         """, unsafe_allow_html=True)
 
+    # =========================
+    # Recording download
+    # =========================
+    st.markdown("---")
+    st.subheader("4. 錄影下載")
+
+    recorded_path = st.session_state.get("recorded_video_path")
+
+    if recorded_path is not None and Path(recorded_path).exists() and Path(recorded_path).stat().st_size > 0:
+        st.markdown(
+            """
+            <div class="record-box">
+                ✅ 錄影完成，可以下載影片。
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        with open(recorded_path, "rb") as f:
+            st.download_button(
+                label="📥 下載錄影影片",
+                data=f,
+                file_name="pose_record.mp4",
+                mime="video/mp4"
+            )
+
+    else:
+        st.info("尚未產生錄影檔。請先按「開始錄影」，再按「停止錄影」。")
+
+
     st.markdown("---")
 
-    st.subheader("4. 使用說明")
+    st.subheader("5. 使用說明")
 
     st.markdown(
         """
         1. 開啟網頁後，請允許瀏覽器使用相機。  
-        2. 按下左側 **Start** 開始監測。  
-        3. 系統會判斷目前姿勢：仰躺、左側躺、右側躺或無人躺著。  
-        4. 若同一姿勢維持超過設定秒數，會觸發警報。  
-        5. 若使用 iPhone，警報聲可能需要手動按「播放警報聲」才會響。
+        2. 按下左側 **Start** 開始即時姿勢監測。  
+        3. 若要錄影，按左側 **⏺ 開始錄影**。  
+        4. 錄影時畫面會顯示 **REC**。  
+        5. 按 **⏹ 停止錄影** 後，右側會出現下載按鈕。  
+        6. 若同一姿勢維持超過設定秒數，會觸發警報。  
+        7. 若使用 iPhone，警報聲可能需要手動按「播放警報聲」才會響。
         """
     )
