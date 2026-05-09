@@ -152,6 +152,11 @@ class AppState:
 
         self.monitoring = False
 
+        # 降低即時偵測負擔用
+        self.frame_count = 0
+        self.last_detect_time = 0
+        self.last_annotated = None
+
         # 錄影相關
         self.recording = False
         self.record_writer = None
